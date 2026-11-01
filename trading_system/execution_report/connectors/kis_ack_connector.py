@@ -1,23 +1,20 @@
 # -*- coding: utf-8 -*-
 """KIS 실시간체결통보(H0IFCNI0) 커넥터.
 
-`RestStreamer`(KIS WebSocket)를 통해 내 주문의 접수/체결/거절 통보를 수신하고,
+`RestStreamer`(KIS WebSocket)를 통해 내 주문의 접수/정정/취소/거부/체결 통보를 수신하고,
 `FuturesSimpleOrderAck`로 변환해 `ExecutionReportRouter`(manager)로 전달합니다.
-브로커는 체결통보에 우리가 발급한 `client_order_id`를 돌려주지 않고 자신의
-주문번호(order_no)만 주므로, 주문 시점에 `OrderService`가 등록해 둔
-`OrderRegistry`의 order_no -> client_order_id 매핑으로 원래 주문을 정확히 복원합니다.
-(order_no로 새 id를 지어내면 Router가 대상 전략을 찾지 못해 ACK가 모두 drop된다.)
 
-주의(실거래 투입 전 확인 필요):
-- `RestStreamer._parse_realtime_data()`의 H0IFCNI0 필드 인덱스는 검증되지 않은
-  추정 매핑입니다. 실제 모의투자 체결통보 원문으로 재검증이 필요합니다.
-- 재연결(disconnect) 이후 누락된 체결통보 복구는 `reconcile_via_rest()`를
-  수동으로(또는 main.py의 주기 작업으로) 호출해 REST 조회로 보정해야 합니다.
-  자동 트리거는 아직 구현하지 않았습니다.
+- 브로커는 체결통보에 우리가 발급한 `client_order_id`를 돌려주지 않고 자신의 주문번호(order_no)만
+  주므로, 주문 시점에 `OrderService`가 등록해 둔 `OrderRegistry`의 order_no -> client_order_id
+  매핑으로 원래 주문과 전략을 복원합니다. (order_no로 새 id를 지어내면 Router가 대상 전략을
+  찾지 못해 ACK가 모두 drop된다.)
+- WebSocket이 끊겼다 다시 붙으면, 끊긴 동안 놓친 체결을 REST 주문체결내역(VTTO5201R)의
+  총체결수량과 비교해 차이만큼 Filled ACK로 보정합니다(`reconcile_via_rest`).
 """
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from typing import Any, Dict, Optional, Set
 
 from trading_system.types.enums import AckType, BuySell, QuoteType
@@ -26,18 +23,25 @@ from trading_system.execution_report.order_registry import OrderRegistry
 
 logger = logging.getLogger(__name__)
 
+# ODER_KIND2: '0'이면 체결통보, 그 외('L')는 주문·정정·취소·거부 접수 통보
+_ORDER_KIND_FILL = "0"
+# RCTF_CLS(정정구분): 0=신규, 1=정정, 2=취소
+_RCTF_REPLACE = "1"
+_RCTF_CANCEL = "2"
 
-def _truthy_flag(value: Any) -> bool:
-    """KIS의 Y/N 또는 1/0 형태 플래그 필드를 관용적으로 참으로 판정."""
-    if value is None:
-        return False
-    v = str(value).strip().upper()
-    return v in ("1", "Y", "YES", "TRUE")
+
+def _to_buysell(raw: Any) -> BuySell:
+    """SELN_BYOV_CLS / SLL_BUY_DVSN_CD: 01=매도, 02=매수."""
+    v = str(raw or "").strip()
+    if v in ("02", "BUY"):
+        return BuySell.BUY
+    if v in ("01", "SELL"):
+        return BuySell.SELL
+    return BuySell.NA
 
 
 class KISAckConnector:
-    """KIS 실시간체결통보 커넥터. `NewBrokerConnector`와
-    동일한 `set_manager()` 인터페이스를 제공합니다."""
+    """KIS 실시간체결통보 커넥터. `NewBrokerConnector`와 동일한 `set_manager()` 인터페이스를 제공합니다."""
 
     def __init__(
         self,
@@ -46,15 +50,29 @@ class KISAckConnector:
         order_registry: OrderRegistry,
         broker_name: str = "kis",
         manager=None,
+        rest_api=None,
+        account: str = "",
     ):
+        """
+        Args:
+            streamer: 체결통보용 `RestStreamer` (주문 계좌와 같은 서버(VPS/PROD) 토큰)
+            hts_id: KIS HTS ID (체결통보 구독 키)
+            order_registry: order_no <-> client_order_id <-> strategy_id 매핑 저장소
+            rest_api: 재연결 후 누락 체결 보정용 REST 클라이언트(없으면 보정 생략)
+            account: 보정 조회 대상 계좌번호("12345678-03")
+        """
         self.streamer = streamer
         self.hts_id = hts_id
         self.order_registry = order_registry
         self.broker_name = broker_name
         self.manager = manager
+        self.rest_api = rest_api
+        self.account = account
 
-        # event_id 기반 중복 제거(`NewBrokerConnector` 수준의 안전장치를 여기에도 둔다).
+        # event_id 기반 중복 제거(실전/모의 체결통보를 두 채널로 받을 때도 한 번만 반영).
         self._seen_event_ids: Set[str] = set()
+        # order_no -> 지금까지 전략에 전달한 누적 체결수량(재연결 보정의 기준).
+        self._filled_qty: Dict[str, int] = defaultdict(int)
 
     def set_manager(self, manager) -> None:
         self.manager = manager
@@ -65,12 +83,17 @@ class KISAckConnector:
             logger.warning("KISAckConnector: HTS ID가 설정되지 않아 체결통보를 구독할 수 없습니다.")
             return False
         try:
-            await self.streamer.subscribe(self.hts_id, quote_type=QuoteType.EXECUTION, callback=self._on_execution)
-            logger.info(f"KISAckConnector: 체결통보 구독 시작 (hts_id={self.hts_id})")
-            return True
+            ok = await self.streamer.subscribe(self.hts_id, quote_type=QuoteType.EXECUTION, callback=self._on_execution)
         except Exception as e:
             logger.error(f"KISAckConnector: 체결통보 구독 실패: {e}")
             return False
+        if not ok:
+            logger.error("KISAckConnector: 체결통보 구독 요청을 보내지 못했습니다(WebSocket 연결 실패).")
+            return False
+        if hasattr(self.streamer, "add_reconnect_listener"):
+            self.streamer.add_reconnect_listener(self.reconcile_via_rest)
+        logger.info(f"KISAckConnector: 체결통보 구독 시작 (hts_id={self.hts_id})")
+        return True
 
     async def stop(self) -> None:
         try:
@@ -78,17 +101,23 @@ class KISAckConnector:
         except Exception as e:
             logger.debug(f"KISAckConnector: 구독 해제 중 오류(무시): {e}")
 
+    # ------------------------------------------------------------------
+    # 실시간 체결통보
+    # ------------------------------------------------------------------
     def _on_execution(self, data: Dict[str, Any]) -> None:
         """`RestStreamer`가 파싱한 체결통보 dict를 받아 ACK로 변환/dispatch."""
-        ack = self._to_ack(data)
+        self._dispatch(self._to_ack(data))
+
+    def _dispatch(self, ack: Optional[FuturesSimpleOrderAck]) -> None:
         if ack is None:
             return
-
         if ack.event_id and ack.event_id in self._seen_event_ids:
-            logger.warning(f"KISAckConnector: 중복 체결통보 drop (event_id={ack.event_id})")
+            logger.debug(f"KISAckConnector: 중복 체결통보 drop (event_id={ack.event_id})")
             return
         if ack.event_id:
             self._seen_event_ids.add(ack.event_id)
+        if ack.ack_type == AckType.Filled:
+            self._filled_qty[ack.order_num] += int(ack.filled_volume)
 
         if self.manager:
             self.manager.on_ack(ack)
@@ -101,42 +130,54 @@ class KISAckConnector:
             logger.warning("KISAckConnector: order_num 없는 체결통보, drop")
             return None
 
-        rfus_yn = data.get("rfus_yn")
-        cntg_yn = data.get("cntg_yn")
-        acpt_yn = data.get("acpt_yn")
+        order_kind = str(data.get("order_kind") or "").strip()
+        rctf_cls = str(data.get("rctf_cls") or "").strip()
+        refused = str(data.get("rfus_yn") or "").strip() == "1"
+        qty = int(data.get("qty") or 0)
+        price = float(data.get("price") or 0.0)
 
-        if _truthy_flag(rfus_yn):
-            ack_type = AckType.Rejected
-        elif _truthy_flag(cntg_yn):
+        filled_volume, filled_price, cancel_or_replace_volume = 0, -1.0, 0
+        if order_kind == _ORDER_KIND_FILL:
             ack_type = AckType.Filled
-        elif _truthy_flag(acpt_yn):
-            ack_type = AckType.Received
+            filled_volume, filled_price = qty, price
+        elif refused:
+            ack_type = AckType.Rejected
+        elif rctf_cls == _RCTF_CANCEL:
+            ack_type = AckType.Canceled
+            cancel_or_replace_volume = qty
+        elif rctf_cls == _RCTF_REPLACE:
+            ack_type = AckType.Replaced
+            cancel_or_replace_volume = qty
         else:
-            # 관례가 다를 수 있어(0/1 반전 등) 방어적으로 Nothing 대신 Received로 처리하지 않고
-            # 명시적으로 Nothing을 반환해 잘못된 상태 갱신을 막는다.
-            logger.warning(
-                f"KISAckConnector: ack_type 판정 불가 (rfus={rfus_yn}, cntg={cntg_yn}, acpt={acpt_yn}) - drop"
-            )
-            return None
+            ack_type = AckType.Received
 
-        buysell_raw = str(data.get("buysell") or "")
-        buysell = BuySell.BUY if buysell_raw in ("02", "BUY") else (
-            BuySell.SELL if buysell_raw in ("01", "SELL") else BuySell.NA
+        # 같은 주문의 부분체결이 여러 번 올 수 있으므로 체결시각/수량/가격까지 키에 포함한다.
+        event_id = f"kis-{order_no}-{ack_type.name}-{data.get('filled_time', '')}-{qty}-{price}"
+        return self._make_ack(
+            ack_type=ack_type,
+            order_no=order_no,
+            original_order_no=str(data.get("original_order_num") or ""),
+            symbol=str(data.get("symbol") or ""),
+            buysell=_to_buysell(data.get("buysell")),
+            filled_volume=filled_volume,
+            filled_price=filled_price,
+            cancel_or_replace_volume=cancel_or_replace_volume,
+            event_id=event_id,
         )
 
-        # client_order_id 복원: 주문 낼 때 OrderService가 REST 응답의 order_no를
-        # OrderRegistry에 미리 등록해둔 매핑을 사용한다(임의로 새로 만들지 않음).
+    def _make_ack(self, *, ack_type: AckType, order_no: str, symbol: str, buysell: BuySell,
+                  event_id: str, original_order_no: str = "", filled_volume: int = 0,
+                  filled_price: float = -1.0, cancel_or_replace_volume: int = 0) -> FuturesSimpleOrderAck:
+        # client_order_id 복원: OrderService가 주문 응답의 order_no로 등록해 둔 매핑을 쓴다.
         client_order_id = self.order_registry.resolve_client_order_id_by_order_no(order_no) or ""
         strategy_id = self.order_registry.resolve_strategy_id(client_order_id) if client_order_id else None
-
-        filled_volume = int(data.get("filled_volume") or 0)
-        filled_price = float(data.get("filled_price") or 0.0)
-        event_id = f"kis-{order_no}-{ack_type.name}-{filled_volume}-{filled_price}"
-
         return FuturesSimpleOrderAck(
             ack_type=ack_type,
-            inst_code=str(data.get("symbol") or ""),
+            account=self.account,
+            inst_code=symbol,
             order_num=order_no,
+            original_order_num=original_order_no,
+            cancel_or_replace_volume=cancel_or_replace_volume,
             filled_price=filled_price,
             filled_volume=filled_volume,
             buysell=buysell,
@@ -146,35 +187,47 @@ class KISAckConnector:
             event_id=event_id,
         )
 
-    async def reconcile_via_rest(self, order_service) -> int:
-        """재연결 등으로 놓쳤을 수 있는 체결/주문상태를 REST 조회로 보정한다.
+    # ------------------------------------------------------------------
+    # 재연결 후 누락 체결 보정
+    # ------------------------------------------------------------------
+    async def reconcile_via_rest(self) -> int:
+        """REST 주문체결내역의 총체결수량과 지금까지 전달한 체결수량을 비교해, 차이를 Filled ACK로 보정합니다.
 
-        자동으로 트리거되지 않으므로, 재연결 감지 로직(main.py 등)에서
-        명시적으로 호출해야 합니다. 반환값은 보정을 시도한 주문 수입니다.
-
-        NOTE: 이 메서드는 스캐폴딩입니다 - `get_future_orders()`의 실제 반환
-        스키마(DataFrame 컬럼명)에 맞춰 별도 검증이 필요합니다.
+        우리 시스템이 낸 주문(OrderRegistry에 order_no가 있는 주문)만 대상으로 하며, 보정 ACK의
+        체결가는 해당 주문의 평균체결가(`avg_idx`)입니다. 반환값은 보정 ACK 건수입니다.
+        `RestStreamer` 재연결 직후 자동으로 호출됩니다.
         """
+        if self.rest_api is None or not self.account:
+            return 0
         try:
-            orders = await order_service.get_future_orders()
+            orders = await self.rest_api.inquire_order_history(self.account, order_status="01", raise_on_error=True)
         except Exception as e:
-            logger.error(f"KISAckConnector: reconcile_via_rest 조회 실패: {e}")
+            logger.error(f"KISAckConnector: 체결 보정 조회 실패: {e}")
             return 0
 
-        count = 0
-        try:
-            df = orders[0] if isinstance(orders, tuple) else orders
-            if hasattr(df, "iterrows"):
-                for _, row in df.iterrows():
-                    order_no = str(row.get("odno") or row.get("ODNO") or "").strip()
-                    if not order_no:
-                        continue
-                    client_order_id = self.order_registry.resolve_client_order_id_by_order_no(order_no)
-                    if not client_order_id:
-                        continue
-                    count += 1
-        except Exception as e:
-            logger.error(f"KISAckConnector: reconcile_via_rest 처리 오류: {e}")
-
-        logger.info(f"KISAckConnector: reconcile_via_rest 완료 (확인된 주문 {count}건)")
-        return count
+        corrected = 0
+        for row in orders or []:
+            order_no = str(row.get("odno") or "").strip()
+            if not order_no or not self.order_registry.resolve_client_order_id_by_order_no(order_no):
+                continue
+            try:
+                total_filled = int(float(row.get("tot_ccld_qty") or 0))
+                avg_price = float(row.get("avg_idx") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            missing = total_filled - self._filled_qty[order_no]
+            if missing <= 0:
+                continue
+            self._dispatch(self._make_ack(
+                ack_type=AckType.Filled,
+                order_no=order_no,
+                original_order_no=str(row.get("orgn_odno") or ""),
+                symbol=str(row.get("pdno") or ""),
+                buysell=_to_buysell(row.get("sll_buy_dvsn_cd")),
+                filled_volume=missing,
+                filled_price=avg_price,
+                event_id=f"kis-reconcile-{order_no}-{total_filled}",
+            ))
+            corrected += 1
+            logger.warning(f"KISAckConnector: 누락 체결 보정 order_no={order_no} qty={missing} @ {avg_price}")
+        return corrected

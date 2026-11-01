@@ -70,7 +70,7 @@ class ExecutionReportRouter:
 
         if target_strategy_id and target_strategy_id in self._strategies_by_id:
             if self._loop is None or self._executor is None:
-                raise RuntimeError("ExecutionReportRouter requires injected (loop, executor) in ver2")
+                raise RuntimeError("ExecutionReportRouter requires injected (loop, executor)")
 
             strategy = self._strategies_by_id[target_strategy_id]
             if not self._executor.is_registered(strategy_id=target_strategy_id):

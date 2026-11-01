@@ -21,7 +21,7 @@ class OrderManager:
     - 전략은 그 `OrderService`만 사용
     하는 구조를 고정합니다.
     """
-    def __init__(self, broker_config: Dict[str, dict]):
+    def __init__(self, broker_config: Dict[str, dict], kill_switch=None):
         """
         broker_config:
             {
@@ -31,6 +31,9 @@ class OrderManager:
             }
         """
         self.drivers = {}
+        # 모든 OrderService가 공유하는 Kill Switch(발동 시 리스크를 늘리는 신규 주문 차단).
+        from trading_system.risk.kill_switch import KillSwitch
+        self.kill_switch = kill_switch or KillSwitch()
         # NOTE: 이 로딩 로직 자체가 broker registry의 단일 진실(SSOT)입니다.
         #       전략/상위 레이어는 broker 문자열("kis", "new_broker")의 의미를
         #       "라우팅 키"로만 취급하고, 구현체/프로토콜(REST/MQ/TCP)은 Driver 내부에 숨깁니다.

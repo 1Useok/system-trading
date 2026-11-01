@@ -17,6 +17,7 @@ from trading_system.types.enums import BuySell as OrderSide, PriceType
 
 from .utils.book import Book, BuySell
 from .utils.time_utils import calculate_time_list, is_after_market_close
+from trading_system.utils.clock import KST
 
 
 class VolBreakingLong:
@@ -26,6 +27,8 @@ class VolBreakingLong:
     Enters long positions when price breaks above base price + threshold * volatility.
     Uses previous day's high-low range as volatility measure.
     """
+
+    ENTRY_SIDE = OrderSide.BUY
 
     def __init__(self, strategy_name: str, real: bool, quote_list: list,
                  clock_list: list, account_dict: dict, bullet: int,
@@ -116,6 +119,7 @@ class VolBreakingLong:
                 price_type=PriceType.LIMIT,
                 account=self.account_dict.get(self.futures_code),
                 time_in_force="DAY",
+                risk_reducing=(side != self.ENTRY_SIDE),  # 진입 반대 방향은 청산/손절
             )
         except Exception as e:
             logging.error(f"{self.strategy_name} order failed: {e}")
@@ -136,7 +140,7 @@ class VolBreakingLong:
         if self.min_close_price is None:
             return
 
-        now = datetime.datetime.now()
+        now = datetime.datetime.now(KST)
         hms = float(now.strftime("%H%M%S.%f"))
 
         # Long Entry
@@ -315,7 +319,7 @@ class VolBreakingLong:
         if self.price is None:
             return
 
-        now = datetime.datetime.now()
+        now = datetime.datetime.now(KST)
         int_hms = int(now.strftime("%H%M%S"))
 
         if self.min_check_time is None:
@@ -333,7 +337,7 @@ class VolBreakingLong:
 
     async def on_filled(self, filled):
         """Handle filled trade data."""
-        now = datetime.datetime.now()
+        now = datetime.datetime.now(KST)
         hms = int(now.strftime("%H%M%S"))
 
         if (not self.base_price_recorded
@@ -361,7 +365,7 @@ class VolBreakingLong:
 
     def _update_vol_size(self) -> Optional[float]:
         """Calculate volatility size from previous day's high-low range."""
-        now = datetime.datetime.now()
+        now = datetime.datetime.now(KST)
         last_day = now - datetime.timedelta(1)
 
         lastday_high_price_list: List[float] = []

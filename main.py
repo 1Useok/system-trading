@@ -25,11 +25,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-from datetime import datetime
 from typing import Any, Dict, Optional
 
 from trading_system.config.config_loader import ConfigLoader
 from trading_system.market_data.connectors.kis_master_loader import KISMasterLoader
+from trading_system.risk.risk_manager import RiskManager
 from trading_system.strategy.strategy_manager import StrategyManager
 from trading_system.strategy.concepts.cb_split_long_only_pct import CBSplitLongOnlyPct
 from trading_system.strategy.concepts.krx_exit_all import KrxExitAll
@@ -38,6 +38,7 @@ from trading_system.strategy.concepts.vol_breaking_long import VolBreakingLong
 from trading_system.strategy.concepts.vol_breaking_short import VolBreakingShort
 from trading_system.types.events import FuturesSimpleFilled
 from trading_system.types.enums import BuySell
+from trading_system.utils.clock import now_kst
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +83,9 @@ async def _nav_poll_loop(
     stg_manager: StrategyManager,
     account: str,
     breakout_strategy: Optional[MinuteHighBreakoutStrategy] = None,
+    risk: Optional[RiskManager] = None,
 ) -> None:
-    """REST `get_future_account_balance()`를 주기적으로 폴링해 NAV/PnL을 로깅합니다."""
+    """REST `get_future_account_balance()`를 주기적으로 폴링해 NAV/PnL을 로깅하고 손실 한도를 점검합니다."""
     if stg_manager.rest_api is None:
         return
     # 시작 점검이 방금 같은 API를 호출했으므로 첫 폴링은 한 주기 쉬었다가 시작한다.
@@ -110,6 +112,8 @@ async def _nav_poll_loop(
                         "- 일시적 오응답일 가능성이 높으니 아래 NAV 값을 그대로 신뢰하지 마세요."
                     )
                 logger.info(f"[NAV] {summary}")
+                if risk is not None:
+                    await risk.on_nav(summary)
         except Exception as e:
             logger.error(f"[NAV] 폴링 오류(계속 진행): {e}")
         await asyncio.sleep(NAV_POLL_INTERVAL_SEC)
@@ -122,7 +126,7 @@ async def _clock_scheduler(stg_manager: StrategyManager, interval_sec: float = 1
     """
     last_sent = None
     while True:
-        now_str = datetime.now().strftime("%H%M%S")
+        now_str = now_kst().strftime("%H%M%S")
         if now_str != last_sent:
             last_sent = now_str
             for strategy_id, strategy in stg_manager.executor.get_registered_strategies().items():
@@ -320,7 +324,9 @@ async def main(strategy_name: str, send_orders: bool, inst_code: Optional[str]) 
     if not account:
         raise SystemExit(".env에 VPS_KIS_ACCOUNT_NO(모의투자 계좌번호, 예: 12345678-03)를 설정하세요.")
 
-    stg_manager = StrategyManager(api_config=cfg, loop=loop)
+    # 1) 상태 복원: 오늘 낸 주문의 order_no <-> 전략 매핑, 실행 리포트 체크포인트
+    state_dir = (cfg.get("runtime") or {}).get("state_dir") or "state"
+    stg_manager = StrategyManager(api_config=cfg, loop=loop, state_dir=state_dir)
 
     logger.info(
         f"[STARTUP] strategy={strategy_name} symbol={inst_code} "
@@ -333,28 +339,45 @@ async def main(strategy_name: str, send_orders: bool, inst_code: Optional[str]) 
         1, {}, {"exit_time": EXIT_ALL_TIME}, "kis",
         strategy_name="KRX_ExitAll", symbol=inst_code,
     )
-    for stg in (strategy, exit_all):
-        stg_manager.register_strategy(stg)
-
     breakout = strategy if isinstance(strategy, MinuteHighBreakoutStrategy) else None
 
+    risk_cfg = cfg.get("risk") or {}
+    risk = RiskManager(
+        stg_manager.order_manager.kill_switch,
+        stg_manager.get_order_service(strategy_name="RiskManager", symbol=inst_code),
+        stg_manager.rest_api,
+        account,
+        max_loss=risk_cfg.get("max_loss"),
+        flatten_on_kill=bool(risk_cfg.get("flatten_on_kill", True)),
+        kill_file=risk_cfg.get("kill_file"),
+    )
+
+    # 2) 계좌 스냅샷: 기존 포지션 확인과 전략 상태 복원 (REST 폴링 시작 전에 끝내야 요청 제한에 안 걸림)
+    await _reconcile_positions_on_startup(stg_manager, account, breakout_strategy=breakout)
+    await asyncio.sleep(AVAILABILITY_CHECK_SPACING_SEC)
+
+    # 3) 체결통보 경로를 시세보다 먼저 연다: 전략이 움직이기 전에 내 주문 결과를 받을 수 있어야 한다.
+    await stg_manager.start_kis_ack()
+
+    # 4) 시세 경로
     prod_cfg = cfg.get("prod_api", {})
     if prod_cfg.get("app_key") and prod_cfg.get("app_secret"):
         await stg_manager.start_kis([inst_code])
-
-    # 시작 점검은 REST 폴링보다 먼저 끝낸다. 동시에 보내면 초당 요청 제한에 걸려 잔고조회가 실패한다.
-    await asyncio.sleep(AVAILABILITY_CHECK_SPACING_SEC)
-    await _reconcile_positions_on_startup(stg_manager, account, breakout_strategy=breakout)
-    await asyncio.sleep(AVAILABILITY_CHECK_SPACING_SEC)
     price_poll_task = asyncio.create_task(_price_poll_loop(stg_manager, inst_code))
-    nav_poll_task = asyncio.create_task(_nav_poll_loop(stg_manager, account, breakout_strategy=breakout))
-    await stg_manager.start_kis_ack()
+
+    # 5) 전략 활성화: 등록 전에는 시세/ACK가 전략에 전달되지 않는다.
+    for stg in (strategy, exit_all):
+        stg_manager.register_strategy(stg)
+
+    # 6) 운영 감시: NAV/손실 한도, 수동 Kill Switch, 시각 이벤트
+    nav_poll_task = asyncio.create_task(_nav_poll_loop(stg_manager, account, breakout_strategy=breakout, risk=risk))
+    kill_watch_task = asyncio.create_task(risk.watch_kill_file())
     clock_task = asyncio.create_task(_clock_scheduler(stg_manager))
 
     try:
         await asyncio.Event().wait()
     finally:
-        for t in (price_poll_task, nav_poll_task, clock_task):
+        for t in (price_poll_task, nav_poll_task, kill_watch_task, clock_task):
             t.cancel()
         await stg_manager.stop_kis_ack()
         await stg_manager.stop_kis()

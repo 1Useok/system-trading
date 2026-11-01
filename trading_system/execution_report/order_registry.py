@@ -15,16 +15,23 @@
   3) 그래도 못 찾으면 drop + warning (오배달 방지)
   하는 방식으로 타겟 디스패치합니다.
 
-주의/한계:
-- 현재 구현은 메모리(in-process) 기반이므로 프로세스 재시작 시 매핑이 초기화됩니다.
-  운영 환경에서 "재시작/복구"까지 다루려면 DB/파일/외부 DMA 쪽 저장 등으로 확장해야 합니다.
-- `QuoteManager`/`NewBrokerConnector`는 동기 호출 경로가 많아 thread-safe가 유리하므로
-  간단한 `threading.Lock`을 사용합니다.
+영속화:
+- `store_path`를 주면 매핑을 JSONL로 append 기록하고, 생성 시 같은 파일을 다시 읽어 복원합니다.
+  프로세스가 장중에 재시작돼도 그 전에 낸 주문의 체결통보가 원래 전략으로 라우팅됩니다.
+- 브로커 주문번호는 거래일마다 새로 매겨지므로 파일은 거래일 단위로 나눕니다(`for_trading_day`).
+- 커넥터 콜백은 다른 스레드에서 올 수 있어 `threading.Lock`으로 보호합니다.
 """
 
+import json
+import logging
+import os
 import threading
 from dataclasses import dataclass
 from typing import Dict, Optional
+
+from trading_system.utils.clock import now_kst
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,8 +43,9 @@ class OrderRegistryEntry:
 class OrderRegistry:
     """주문 라우팅을 위한 `client_order_id -> strategy_id` 매핑 저장소(SSOT)."""
 
-    def __init__(self):
+    def __init__(self, store_path: Optional[str] = None):
         self._lock = threading.Lock()
+        self._store_path = store_path
         self._by_client_order_id: Dict[str, OrderRegistryEntry] = {}
         # 브로커가 발급한 실제 주문번호(order_no) -> client_order_id.
         # 브로커의 체결통보/응답은 보통 client_order_id가 아니라 브로커 고유의 주문번호만
@@ -45,6 +53,39 @@ class OrderRegistry:
         # 동기적으로 받는 시점) 이 매핑을 등록해두고, ACK 수신 시 이 매핑으로 client_order_id를
         # 역참조한 뒤 위 `_by_client_order_id`로 strategy_id까지 2단계로 역참조합니다.
         self._order_no_to_client_order_id: Dict[str, str] = {}
+        if store_path:
+            self._load()
+
+    @classmethod
+    def for_trading_day(cls, state_dir: str) -> "OrderRegistry":
+        """`state_dir/order_registry_YYYYMMDD.jsonl`(KST 기준 오늘)에 기록하는 registry를 만듭니다."""
+        os.makedirs(state_dir, exist_ok=True)
+        return cls(os.path.join(state_dir, f"order_registry_{now_kst():%Y%m%d}.jsonl"))
+
+    def _load(self) -> None:
+        if not os.path.exists(self._store_path):
+            return
+        loaded = 0
+        with open(self._store_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # 기록 도중 종료된 마지막 줄 등
+                if rec.get("t") == "cid":
+                    self._by_client_order_id[rec["client_order_id"]] = OrderRegistryEntry(
+                        client_order_id=rec["client_order_id"], strategy_id=rec["strategy_id"],
+                    )
+                elif rec.get("t") == "ono":
+                    self._order_no_to_client_order_id[rec["order_no"]] = rec["client_order_id"]
+                loaded += 1
+        logger.info(f"OrderRegistry: {loaded} records restored from {self._store_path}")
+
+    def _append(self, record: dict) -> None:
+        if not self._store_path:
+            return
+        with open(self._store_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def register(self, client_order_id: str, strategy_id: str) -> None:
         """주문 의도(`client_order_id`)가 어느 전략에서 나왔는지 기록합니다.
@@ -59,6 +100,7 @@ class OrderRegistry:
                 client_order_id=client_order_id,
                 strategy_id=strategy_id,
             )
+            self._append({"t": "cid", "client_order_id": client_order_id, "strategy_id": strategy_id})
 
     def resolve_strategy_id(self, client_order_id: str) -> Optional[str]:
         """ACK에서 들어온 `client_order_id`로 전략 식별자를 역참조합니다."""
@@ -80,6 +122,7 @@ class OrderRegistry:
             return
         with self._lock:
             self._order_no_to_client_order_id[str(order_no)] = client_order_id
+            self._append({"t": "ono", "order_no": str(order_no), "client_order_id": client_order_id})
 
     def resolve_client_order_id_by_order_no(self, order_no: str) -> Optional[str]:
         """브로커 주문번호(`order_no`)로 `client_order_id`를 역참조합니다."""

@@ -11,6 +11,7 @@ from trading_system.api.base import BaseApi
 from trading_system.types.enums import BuySell, OrderType, PriceType
 from trading_system.types.events import FuturesSimpleOrderAck, FuturesSimpleQuote
 from trading_system.api.kis.token_manager import KISTokenManager
+from trading_system.utils.clock import now_kst
 
 
 logger = logging.getLogger(__name__)
@@ -204,7 +205,7 @@ class RestApi(BaseApi):
             return pd.DataFrame()
 
     async def get_stock_orders(self, account: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> pd.DataFrame:
-        today = datetime.now()
+        today = now_kst()
         start = datetime.strptime(start_date or today.strftime("%Y%m%d"), "%Y%m%d")
         end = datetime.strptime(end_date or today.strftime("%Y%m%d"), "%Y%m%d")
         three_months_ago = today - timedelta(days=90)
@@ -336,9 +337,9 @@ class RestApi(BaseApi):
         # 기본값 설정: 당일 조회
         from datetime import datetime
         if not start_date:
-            start_date = datetime.now().strftime("%Y%m%d")
+            start_date = now_kst().strftime("%Y%m%d")
         if not end_date:
-            end_date = datetime.now().strftime("%Y%m%d")
+            end_date = now_kst().strftime("%Y%m%d")
             
         # API 문서에 따른 필수 Query Parameter 구성
         params = {
@@ -449,7 +450,7 @@ class RestApi(BaseApi):
         필요로 하는 전일 고가/저가는 별도의 일봉 조회(`FHKIF03020100`)를 통해서만
         얻을 수 있습니다. 일봉 조회 TR_ID/파라미터 규약을 사용합니다.
         """
-        today = datetime.now()
+        today = now_kst()
         start = (today - timedelta(days=10)).strftime("%Y%m%d")
         end = today.strftime("%Y%m%d")
         params = {
@@ -521,30 +522,6 @@ class RestApi(BaseApi):
                 logger.warning("현재 선물옵션 운영시간이 아닙니다. 모의투자 환경에서도 운영시간을 확인해주세요.")
             return {"rt_cd": "1", "msg1": str(e)}
 
-    async def cancel_future_order(self, account: str, order_no: str, quantity: int = 0) -> bool:
-        # API 문서에 따른 취소 주문 파라미터
-        params = {
-            "ORD_PRCS_DVSN_CD": "02",     # 주문처리구분코드 (02: 주문전송)
-            "CANO": account[:8],          # 계좌번호 앞 8자리  
-            "ACNT_PRDT_CD": account[-2:], # 계좌번호 뒤 2자리
-            "RVSE_CNCL_DVSN_CD": "02",    # 정정취소구분코드 (02: 취소)
-            "ORGN_ODNO": order_no,        # 원주문번호
-            "ORD_QTY": str(quantity),     # 주문수량 (0: 전량취소)
-            "UNIT_PRICE": "0",            # 주문가격 (취소시 0)
-            "NMPR_TYPE_CD": "01",         # 호가유형코드 (01: 지정가)
-            "KRX_NMPR_CNDT_CD": "0",      # 한국거래소호가조건코드 (취소시 0)
-            "RMN_QTY_YN": "Y",            # 잔여수량여부 (Y: 전량)
-            "FUOP_ITEM_DVSN_CD": ""       # 선물옵션종목구분코드 (공란)
-        }
-        logger.info(f"Canceling future order: {order_no} ({quantity} contracts)")
-        try:
-            await self.request_data("VTTO1103U", params)
-            logger.info("Future order cancelled successfully")
-            return True
-        except Exception as e:
-            logger.error(f"Error during future order cancellation: {e}")
-            return False
-
     # 실시간 시세/체결 구독 관련 (WebSocket)
     def subscribe_order(self, callback: Callable[[FuturesSimpleOrderAck], None]) -> None:
         logger.info("Subscribing to order execution updates")
@@ -606,8 +583,8 @@ class RestApi(BaseApi):
         logger.info("WebSocket connection established")
         # WebSocket 연결 후 초기화 처리
     
-    async def inquire_order_history(self, account: str, start_date: str = None, end_date: str = None, 
-                                   order_status: str = "02") -> List[Dict]:
+    async def inquire_order_history(self, account: str, start_date: str = None, end_date: str = None,
+                                   order_status: str = "02", raise_on_error: bool = False) -> List[Dict]:
         """
         선물옵션 주문체결내역조회
         
@@ -616,6 +593,8 @@ class RestApi(BaseApi):
             start_date: 시작일자 (YYYYMMDD, 기본값: 오늘)
             end_date: 종료일자 (YYYYMMDD, 기본값: 오늘)
             order_status: "00"=전체, "01"=체결, "02"=미체결
+            raise_on_error: True면 조회 실패 시 빈 목록 대신 예외를 던진다
+                (빈 목록을 "주문 없음"으로 오인하면 안 되는 일괄 취소/체결 보정에서 사용).
         
         Returns:
             미체결 주문 리스트
@@ -623,9 +602,9 @@ class RestApi(BaseApi):
         from datetime import datetime
         
         if start_date is None:
-            start_date = datetime.now().strftime("%Y%m%d")
+            start_date = now_kst().strftime("%Y%m%d")
         if end_date is None:
-            end_date = datetime.now().strftime("%Y%m%d")
+            end_date = now_kst().strftime("%Y%m%d")
             
         # API 문서에 따른 파라미터 설정
         params = {
@@ -656,10 +635,14 @@ class RestApi(BaseApi):
             else:
                 error_msg = result.get('msg1', '알 수 없는 오류')
                 logger.error(f"주문 내역 조회 실패: {error_msg}")
+                if raise_on_error:
+                    raise RuntimeError(f"KIS API error (VTTO5201R): {error_msg}")
                 return []
-                
+
         except Exception as e:
             logger.error(f"주문 내역 조회 중 오류: {e}")
+            if raise_on_error:
+                raise
             return []
 
     async def cancel_future_order(self, account: str, original_order_no: str, symbol: str = "", 

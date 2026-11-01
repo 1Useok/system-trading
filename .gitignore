@@ -24,3 +24,7 @@ venv/
 .idea/
 .vscode/
 *.log
+
+# Runtime state / manual kill switch
+state/
+KILL

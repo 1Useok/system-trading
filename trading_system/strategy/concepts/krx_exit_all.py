@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 from trading_system.types.enums import AckType, BuySell, NewOrCancelOrReplace, PriceType
 from trading_system.book.order_book import Book
+from trading_system.book.positions import extract_positions
 from trading_system.order.order_service import OrderService
 from trading_system.strategy.concepts.abstract_strategy import Strategy
 
@@ -86,65 +87,8 @@ class KrxExitAll(Strategy):
         return None
 
     def _extract_positions(self, balance_result) -> Iterable[Tuple[str, int]]:
-        """브로커별 잔고 응답에서 (symbol, net_qty) 목록을 추출.
-
-        KIS(RestApi) 기준:
-        - `get_future_account_balance()` -> (DataFrame, summary)
-        - DataFrame row에 `shtn_pdno`, `sll_buy_dvsn_name`, `cblc_qty` 등이 포함될 수 있음
-        """
-        if balance_result is None:
-            return []
-
-        # KIS 형식: (df, summary)
-        if isinstance(balance_result, tuple) and balance_result:
-            df = balance_result[0]
-        else:
-            df = balance_result
-
-        positions = []
-
-        # pandas DataFrame
-        if hasattr(df, "iterrows"):
-            for _, row in df.iterrows():
-                symbol = str(row.get("shtn_pdno") or row.get("symbol") or row.get("inst_code") or "").strip()
-                if not symbol:
-                    continue
-                side_name = str(row.get("sll_buy_dvsn_name") or row.get("side") or "").strip()
-                qty_raw = row.get("cblc_qty", row.get("net_qty", 0))
-                try:
-                    qty = int(float(qty_raw))
-                except Exception:
-                    qty = 0
-
-                # side_name이 매도라면 음수로 취급
-                if side_name in ("SLL", "SELL", "매도"):
-                    qty = -abs(qty)
-                else:
-                    qty = abs(qty)
-
-                if qty != 0:
-                    positions.append((symbol, qty))
-
-            return positions
-
-        # dict / list fallback
-        if isinstance(df, dict):
-            symbol = str(df.get("symbol") or df.get("inst_code") or "").strip()
-            qty = int(df.get("net_qty", 0))
-            if symbol and qty:
-                return [(symbol, qty)]
-
-        if isinstance(df, list):
-            for item in df:
-                if not isinstance(item, dict):
-                    continue
-                symbol = str(item.get("symbol") or item.get("inst_code") or item.get("shtn_pdno") or "").strip()
-                qty = int(item.get("net_qty", item.get("cblc_qty", 0)) or 0)
-                if symbol and qty:
-                    positions.append((symbol, qty))
-            return positions
-
-        return []
+        """브로커 잔고 응답에서 (symbol, net_qty) 목록을 추출(매도 포지션은 음수)."""
+        return extract_positions(balance_result)
 
     async def _flatten_position(self, account: str, symbol: str, net_qty: int) -> None:
         if self.order_service is None:
@@ -169,6 +113,7 @@ class KrxExitAll(Strategy):
                 price_type=PriceType.MARKET,
                 account=account,
                 time_in_force="DAY",
+                risk_reducing=True,
             )
         else:
             rsp = None

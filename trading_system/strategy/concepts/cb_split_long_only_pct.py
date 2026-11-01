@@ -20,6 +20,7 @@ import datetime
 import logging
 from trading_system.book.order_book import Book
 import math
+from trading_system.utils.clock import KST
 
 
 class CBSplitLongOnlyPct(Strategy):
@@ -153,7 +154,7 @@ class CBSplitLongOnlyPct(Strategy):
             return None
 
         # 현재 시간 확인
-        now = datetime.datetime.now()
+        now = datetime.datetime.now(KST)
         hms = now.strftime("%H%M%S.%f")
 
         # 각 분할 주문에 대해 실행 시간 확인
@@ -247,7 +248,7 @@ class CBSplitLongOnlyPct(Strategy):
             return None
 
         # 현재 시간 확인
-        now = datetime.datetime.now()
+        now = datetime.datetime.now(KST)
         hms = now.strftime("%H%M%S.%f")
 
         # 각 분할 주문에 대해 실행 시간 확인
@@ -278,6 +279,7 @@ class CBSplitLongOnlyPct(Strategy):
                                 price_type=PriceType.LIMIT,
                                 account=self.account_dict[self.futures_code],
                                 time_in_force="DAY",
+                                risk_reducing=True,
                             )
                         except Exception as e:
                             ord_rsp = None
@@ -451,7 +453,7 @@ class CBSplitLongOnlyPct(Strategy):
             None
         """
         # 현재 시간 및 가격 정보 업데이트
-        now = datetime.datetime.now()
+        now = datetime.datetime.now(KST)
         hms = now.strftime("%H%M%S")
         self.price = float(filled.price)
         self.health_check_value = str(filled.price)

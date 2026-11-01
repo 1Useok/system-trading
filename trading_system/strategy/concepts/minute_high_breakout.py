@@ -197,6 +197,7 @@ class MinuteHighBreakoutStrategy:
                 price_type=PriceType.LIMIT,
                 account=self.account,
                 time_in_force="DAY",
+                risk_reducing=(side == BuySell.SELL),  # 롱 온리: 매도는 청산
             )
         except Exception as e:
             logger.error(f"주문 실패({reason}): {e}")

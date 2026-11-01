@@ -1,5 +1,7 @@
 import logging
-from collections import defaultdict
+import json
+import os
+from collections import defaultdict, deque
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 from trading_system.types.enums import AckType, BuySell
@@ -25,23 +27,76 @@ class NewBrokerConnector:
         manager=None,
         broker_name: str = "new_broker",
         strict_seq: bool = True,
+        checkpoint_path: Optional[str] = None,
+        max_event_ids: int = 10000,
     ):
+        """
+        Args:
+            checkpoint_path: 지정하면 (브로커, 계좌)별 `last_seq`와 최근 `event_id`를 JSON으로 저장하고
+                생성 시 복원한다. 재시작 후 DMA가 같은 이벤트를 다시 보내도(at-least-once) 한 번만 반영하고,
+                재구독 시작점(`resume_seq`)을 알 수 있다.
+            max_event_ids: 브로커별로 기억할 최근 event_id 개수(메모리/파일 크기 상한)
+        """
         self.manager = manager
         self.broker_name = broker_name
+        self.checkpoint_path = checkpoint_path
+        self.max_event_ids = max_event_ids
         # `strict_seq=True`면 seq 역순(out-of-order) 이벤트를 drop 합니다.
         # 운영에서 역순을 "버퍼링 후 정렬"로 처리할 수도 있지만,
         # 현재 단계에서는 정합성 깨짐을 방지하기 위해 보수적으로 drop + 로그를 선택했습니다.
         self.strict_seq = strict_seq
 
         # idempotency / ordering guard
-        # idempotency / ordering guard
         # - event_id: at-least-once 전송에서 중복은 정상일 수 있으므로 1회만 처리
         # - seq: 단조 증가(또는 그에 준하는 정렬키)로 역순/유실을 감지
         self._seen_event_ids = defaultdict(set)  # broker -> set[event_id]
+        self._event_id_order = defaultdict(deque)  # broker -> 기억 순서(오래된 것부터 정리)
         self._last_seq = {}  # (broker, account) -> last_seq
+        if checkpoint_path:
+            self._load_checkpoint()
 
     def set_manager(self, manager):
         self.manager = manager
+
+    def resume_seq(self, account: str = "") -> Optional[int]:
+        """재연결/재시작 시 DMA에 replay를 요청할 시작점(마지막으로 반영한 seq)."""
+        return self._last_seq.get((self.broker_name, account))
+
+    def _remember_event_id(self, broker: str, event_id: str) -> None:
+        self._seen_event_ids[broker].add(event_id)
+        order = self._event_id_order[broker]
+        order.append(event_id)
+        while len(order) > self.max_event_ids:
+            self._seen_event_ids[broker].discard(order.popleft())
+
+    def _load_checkpoint(self) -> None:
+        if not os.path.exists(self.checkpoint_path):
+            return
+        try:
+            with open(self.checkpoint_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error("NewBrokerConnector: checkpoint load failed (%s): %s", self.checkpoint_path, e)
+            return
+        for k, seq in (data.get("last_seq") or {}).items():
+            broker, _, account = k.partition("|")
+            self._last_seq[(broker, account)] = int(seq)
+        for broker, ids in (data.get("event_ids") or {}).items():
+            for event_id in ids:
+                self._remember_event_id(broker, event_id)
+        logger.info("NewBrokerConnector: checkpoint restored (last_seq=%s)", self._last_seq)
+
+    def _save_checkpoint(self) -> None:
+        if not self.checkpoint_path:
+            return
+        data = {
+            "last_seq": {f"{b}|{a}": s for (b, a), s in self._last_seq.items()},
+            "event_ids": {b: list(ids) for b, ids in self._event_id_order.items()},
+        }
+        tmp = f"{self.checkpoint_path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, self.checkpoint_path)  # 쓰는 도중 종료돼도 이전 체크포인트가 깨지지 않게
 
     def ingest_execution_report(self, report: Dict[str, Any]) -> Optional[FuturesSimpleOrderAck]:
         """ExecutionReport 1건을 처리합니다.
@@ -60,7 +115,6 @@ class NewBrokerConnector:
                     ack.event_id,
                 )
                 return None
-            self._seen_event_ids[ack.broker].add(ack.event_id)
 
         # 정렬/역순 방지 (seq)
         if ack.seq is not None:
@@ -76,6 +130,11 @@ class NewBrokerConnector:
             # last_seq 갱신은 drop을 통과한 뒤에만
             if last is None or ack.seq > last:
                 self._last_seq[key] = ack.seq
+
+        # 통과한 이벤트만 기억한다(역순으로 drop된 이벤트가 재전송되면 다시 판정받도록).
+        if ack.event_id:
+            self._remember_event_id(ack.broker, ack.event_id)
+        self._save_checkpoint()
 
         # 최종 dispatch (ExecutionReportRouter → Strategy)
         if self.manager:

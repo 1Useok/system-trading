@@ -23,6 +23,7 @@
 import asyncio
 import inspect
 import logging
+import os
 from typing import Any, Dict, Optional, Type
 
 from trading_system.order.execution_routing import resolve_broker
@@ -49,8 +50,16 @@ class StrategyManager:
         *,
         loop: Optional[asyncio.AbstractEventLoop] = None,
         executor: Optional[StrategyExecutor] = None,
+        state_dir: Optional[str] = None,
     ):
+        """
+        Args:
+            api_config: `ConfigLoader.get_config()` 결과
+            state_dir: 재시작 복구용 상태 파일 디렉터리(주문 매핑, 실행 리포트 체크포인트).
+                None이면 메모리에만 둔다(테스트/드라이런용).
+        """
         self.api_config: Dict[str, Any] = api_config or {}
+        self.state_dir = state_dir
 
         # KIS 초기화 (설정에 KIS가 있을 때만 import & 생성)
         #
@@ -84,7 +93,8 @@ class StrategyManager:
             logger.info("No KIS config - skipping KIS init")
 
         # strategy_id 기반 ACK 라우팅을 위한 registry
-        self.order_registry = OrderRegistry()
+        # 장중 재시작 후에도 이전 주문의 체결통보가 원래 전략으로 가도록 매핑을 파일로 남긴다.
+        self.order_registry = OrderRegistry.for_trading_day(state_dir) if state_dir else OrderRegistry()
 
         # 단일 asyncio 루프 전제:
         # - 전략 콜백 실행은 `StrategyExecutor`만 수행
@@ -122,7 +132,10 @@ class StrategyManager:
             self.market_data_hub.add_connector(self.kis_connector)
 
         # ExecutionReport 전용 커넥터(네트워크 구현 전에도 드라이런 가능)
-        self.new_broker_connector = NewBrokerConnector(broker_name="new_broker")
+        self.new_broker_connector = NewBrokerConnector(
+            broker_name="new_broker",
+            checkpoint_path=os.path.join(state_dir, "new_broker_checkpoint.json") if state_dir else None,
+        )
         self.execution_report_router.add_connector(self.new_broker_connector)
 
         # KIS 체결통보 커넥터 (KIS 설정이 있고 execution.allow_kis_ack가 true일 때만)
@@ -143,12 +156,14 @@ class StrategyManager:
                 )
             else:
                 from trading_system.api.kis.rest_streamer import RestStreamer
-                self._kis_ack_streamer = RestStreamer(self.token_manager)  # VPS
+                self._kis_ack_streamer = RestStreamer(self.token_manager)  # VPS -> 모의투자 WebSocket
                 self.kis_ack_connector = KISAckConnector(
                     streamer=self._kis_ack_streamer,
                     hts_id=hts_id,
                     order_registry=self.order_registry,
                     broker_name="kis",
+                    rest_api=self.rest_api,
+                    account=vps_cfg.get("account_no") or "",
                 )
                 self.execution_report_router.add_connector(self.kis_ack_connector)
                 logger.info("KISAckConnector initialized (vps token)")

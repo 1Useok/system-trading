@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Awaitable, Callable, Dict, List, Optional, TYPE_CHECKING
 import websockets
 
 from trading_system.types.enums import QuoteType, StreamerStatus
@@ -22,11 +22,16 @@ logger = logging.getLogger(__name__)
 class RestStreamer:
     """KIS 실시간 데이터(WebSocket) 스트리머"""
 
-    # API 문서에 따르면 선물옵션 실시간은 다른 URL 사용
-    WS_URL = os.getenv("KIS_WS_URL", "ws://ops.koreainvestment.com:21000")  # 선물옵션용
+    # 실전/모의 WebSocket 엔드포인트가 다르다. 모의투자 approval key로 실전 엔드포인트에
+    # 붙으면 구독 응답은 성공으로 오지만 모의계좌 체결통보는 전달되지 않는다.
+    WS_URL_PROD = os.getenv("KIS_WS_URL", "ws://ops.koreainvestment.com:21000")
+    WS_URL_VPS = os.getenv("KIS_WS_URL_VPS", "ws://ops.koreainvestment.com:31000")
+
+    RECONNECT_BACKOFF_SEC = (1, 2, 5, 10, 30)
 
     def __init__(self, token_manager: 'KISTokenManager'):
         self.token_manager = token_manager
+        self.ws_url = self.WS_URL_VPS if getattr(token_manager, "svr", "prod") == "vps" else self.WS_URL_PROD
         self._ws = None
         self._status = StreamerStatus.DISCONNECTED
         # sub_key -> (원본 symbol/HTS ID, quote_type). 재연결 시 원본 값으로 재구독하기 위해
@@ -39,6 +44,9 @@ class RestStreamer:
         # AES key/iv를 받아 저장해둔다. tr_id별로 다를 수 있어 dict로 관리.
         self._aes_key: Dict[str, str] = {}
         self._aes_iv: Dict[str, str] = {}
+        # 재연결 + 재구독이 끝난 뒤 호출할 콜백(예: 끊긴 동안 놓친 체결 보정).
+        self._reconnect_listeners: List[Callable[[], Awaitable[None]]] = []
+        self._closing = False
 
     @property
     def status(self) -> StreamerStatus:
@@ -49,11 +57,11 @@ class RestStreamer:
             return True
         self._status = StreamerStatus.CONNECTING
         try:
-            self._ws = await websockets.connect(self.WS_URL)
+            self._ws = await websockets.connect(self.ws_url)
             await self._authenticate()
             self._status = StreamerStatus.CONNECTED
             asyncio.create_task(self._message_handler())
-            logger.info("WebSocket connection established.")
+            logger.info(f"WebSocket connection established ({self.ws_url}).")
             return True
         except Exception as e:
             self._status = StreamerStatus.ERROR
@@ -91,52 +99,58 @@ class RestStreamer:
         if not self._ws or self._status != StreamerStatus.CONNECTED:
             if not await self.connect():
                 return False
+        tr_ids = self._tr_ids_for(quote_type)
+        if not tr_ids:
+            logger.warning(f"Unknown quote type: {quote_type}")
+            return False
         self._subscribed_symbols[sub_key] = (symbol, quote_type)
         if callback:
             self._callbacks[sub_key] = callback
-        # API 문서에 따른 선물옵션 실시간 구독 형식
-        if quote_type == QuoteType.TICK:
-            tr_id = "H0IFCNT0"  # 지수선물 실시간체결가
-        elif quote_type == QuoteType.ORDERBOOK:
-            tr_id = "H0IFASP0"  # 지수선물 실시간호가
-        elif quote_type == QuoteType.EXECUTION:
-            tr_id = "H0IFCNI0"  # 선물옵션 실시간체결통보 (내 주문)
-        else:
-            logger.warning(f"Unknown quote type: {quote_type}")
-            return False
 
-        subscribe_data = {
+        # TICK/ORDERBOOK: tr_key=종목코드, EXECUTION: tr_key=HTS ID
+        for tr_id in tr_ids:
+            await self._ws.send(json.dumps(self._subscription_message(tr_id, symbol, tr_type="1")))
+        logger.info(f"Subscribed to {symbol} ({quote_type.name}: {','.join(tr_ids)})")
+        return True
+
+    # H0IFCNT0: 지수선물 체결, H0IFASP0: 지수선물 호가, H0IFCNI0/H0IFCNI9: 선물옵션 체결통보(내 주문)
+    _TR_IDS = {QuoteType.TICK: ("H0IFCNT0",), QuoteType.ORDERBOOK: ("H0IFASP0",), QuoteType.EXECUTION: ("H0IFCNI0",)}
+    # 모의투자 체결통보는 H0IFCNI9로 안내되기도 해서(KIS 샘플 간 표기가 다름) 둘 다 구독한다.
+    # 같은 통보가 두 채널로 오면 KISAckConnector가 event_id로 한 번만 반영한다.
+    _VPS_EXECUTION_TR_IDS = ("H0IFCNI0", "H0IFCNI9")
+    EXECUTION_TR_IDS = frozenset(("H0IFCNI0", "H0IFCNI9"))
+
+    def _tr_ids_for(self, quote_type: QuoteType) -> tuple:
+        if quote_type == QuoteType.EXECUTION and getattr(self.token_manager, "svr", "prod") == "vps":
+            return self._VPS_EXECUTION_TR_IDS
+        return self._TR_IDS.get(quote_type, ())
+
+    def _subscription_message(self, tr_id: str, tr_key: str, tr_type: str) -> Dict:
+        """KIS 실시간 등록/해제 요청 메시지. tr_type: "1"=등록, "2"=해제."""
+        return {
             "header": {
                 "approval_key": self._approval_key,
                 "custtype": "P",  # 개인
-                "tr_type": "1",   # 1: 등록
-                "content-type": "utf-8"
+                "tr_type": tr_type,
+                "content-type": "utf-8",
             },
-            "body": {
-                "input": {
-                    "tr_id": tr_id,
-                    "tr_key": symbol  # TICK/ORDERBOOK: 종목코드, EXECUTION: HTS ID
-                }
-            }
+            "body": {"input": {"tr_id": tr_id, "tr_key": tr_key}},
         }
-        await self._ws.send(json.dumps(subscribe_data))
-        logger.info(f"Subscribed to {symbol} ({quote_type.name})")
-        return True
+
+    def add_reconnect_listener(self, callback: Callable[[], Awaitable[None]]) -> None:
+        """재연결과 재구독이 끝난 뒤 호출할 async 콜백을 등록합니다."""
+        self._reconnect_listeners.append(callback)
 
     async def unsubscribe(self, symbol: str):
-        # 모든 quote_type에 대해 구독 해제
+        """해당 종목(또는 HTS ID)의 모든 구독을 해제합니다."""
         keys_to_remove = [key for key in self._subscribed_symbols.keys() if key.startswith(f"{symbol}_")]
         for key in keys_to_remove:
-            del self._subscribed_symbols[key]
-            if key in self._callbacks:
-                del self._callbacks[key]
-        if self._ws and self._status == StreamerStatus.CONNECTED:
-            unsubscribe_data = {
-                "type": "unsubscribe",
-                "symbol": symbol
-            }
-            await self._ws.send(json.dumps(unsubscribe_data))
-            logger.info(f"Unsubscribed from {symbol}")
+            _, quote_type = self._subscribed_symbols.pop(key)
+            self._callbacks.pop(key, None)
+            if self._ws and self._status == StreamerStatus.CONNECTED:
+                for tr_id in self._tr_ids_for(quote_type):
+                    await self._ws.send(json.dumps(self._subscription_message(tr_id, symbol, tr_type="2")))
+                logger.info(f"Unsubscribed from {symbol} ({quote_type.name})")
 
     async def _message_handler(self):
         try:
@@ -159,7 +173,7 @@ class RestStreamer:
                         encrypt_flag = parts[0]
                         tr_id = parts[1] if len(parts) > 1 else ""
 
-                        if tr_id == "H0IFCNI0":
+                        if tr_id in self.EXECUTION_TR_IDS:
                             self._handle_execution_notice(encrypt_flag, tr_id, parts[3] if len(parts) > 3 else "")
                             continue
 
@@ -217,17 +231,33 @@ class RestStreamer:
             await self._handle_disconnect()
 
     async def _handle_disconnect(self):
+        if self._closing:
+            return
         self._status = StreamerStatus.DISCONNECTED
-        logger.warning("WebSocket disconnected. Reconnecting in 5 seconds...")
-        await asyncio.sleep(5)
-        await self.connect()
-        # sub_key가 아니라 원본 symbol/quote_type으로 재구독해야 한다(버그 수정).
+        attempt = 0
+        while not self._closing:
+            delay = self.RECONNECT_BACKOFF_SEC[min(attempt, len(self.RECONNECT_BACKOFF_SEC) - 1)]
+            logger.warning(f"WebSocket disconnected. Reconnecting in {delay}s (attempt {attempt + 1})...")
+            await asyncio.sleep(delay)
+            if await self.connect():
+                break
+            attempt += 1
+        if self._closing:
+            return
+        # sub_key가 아니라 원본 symbol/quote_type으로 재구독한다.
         previous = dict(self._subscribed_symbols)
+        callbacks = dict(self._callbacks)
         self._subscribed_symbols.clear()
         for sub_key, (symbol, qt) in previous.items():
-            await self.subscribe(symbol, qt, self._callbacks.get(sub_key))
+            await self.subscribe(symbol, qt, callbacks.get(sub_key))
+        for listener in self._reconnect_listeners:
+            try:
+                await listener()
+            except Exception as e:
+                logger.error(f"RestStreamer: reconnect listener failed: {e}")
 
     async def close(self):
+        self._closing = True
         if self._ws:
             await self._ws.close()
             self._status = StreamerStatus.DISCONNECTED
@@ -237,8 +267,7 @@ class RestStreamer:
         """구독 성공 system 메시지에서 체결통보용 AES key/iv를 추출해 저장한다.
 
         KIS는 암호화가 필요한 tr_id(H0IFCNI0 등)를 처음 구독할 때, 그 응답의
-        `body.output.key`/`body.output.iv`에 이후 데이터 프레임 복호화에 쓸 값을
-        실어 보낸다. 정확한 응답 스키마는 실제 KIS 서버 응답으로 검증이 필요하다.
+        `body.output.key`/`body.output.iv`에 이후 데이터 프레임 복호화에 쓸 값을 실어 보낸다.
         """
         try:
             body = system_message.get("body") or {}
@@ -324,34 +353,39 @@ class RestStreamer:
                     }
             elif tr_id == "H0IFASP0":  # 호가 데이터
                 # fields[0]: 시간, fields[1]: FUTS_ASKP1, fields[5]: FUTS_BIDP1
-                if len(fields) >= 16:  # 최소 필드 개수 확인
+                # (종목코드를 뗀 뒤) 0:BSOP_HOUR, 1~5:ASKP1~5, 6~10:BIDP1~5,
+                # 11~15:ASKP_CSNU(건수), 16~20:BIDP_CSNU, 21~25:ASKP_RSQN(잔량), 26~30:BIDP_RSQN
+                if len(fields) >= 27:
                     return {
                         "symbol": symbol,
-                        "best_ask_price": float(fields[1]) if fields[1] else 0,  # FUTS_ASKP1
-                        "best_bid_price": float(fields[6]) if fields[6] else 0,  # FUTS_BIDP1 (6번째)
-                        "best_ask_volume": int(fields[11]) if fields[11] else 0, # ASKP_RSQN1 (11번째)
-                        "best_bid_volume": int(fields[16]) if fields[16] else 0  # BIDP_RSQN1 (16번째)
+                        "best_ask_price": float(fields[1]) if fields[1] else 0,   # FUTS_ASKP1
+                        "best_bid_price": float(fields[6]) if fields[6] else 0,   # FUTS_BIDP1
+                        "best_ask_volume": int(fields[21]) if fields[21] else 0,  # ASKP_RSQN1
+                        "best_bid_volume": int(fields[26]) if fields[26] else 0,  # BIDP_RSQN1
                     }
-            elif tr_id == "H0IFCNI0":  # 체결통보(내 주문)
-                # !!! 검증 필요(VERIFY BEFORE LIVE) !!!
-                # 아래 필드 순서는 KIS 선물옵션 실시간체결통보의 공개된 필드 목록을
-                # 기반으로 한 추정 매핑이며, 실제 KIS 서버 응답으로 검증되지 않았습니다.
-                # 실거래 투입 전 반드시 실제 모의투자 체결통보 원문으로 인덱스를 재확인하세요.
-                if len(fields) >= 14:
+            elif tr_id in self.EXECUTION_TR_IDS:  # 체결통보(내 주문). 종목코드 접두 없이 cust_id부터 시작
+                # 0:CUST_ID 1:ACNT_NO 2:ODER_NO 3:OODER_NO 4:SELN_BYOV_CLS 5:RCTF_CLS 6:ODER_KIND2
+                # 7:STCK_SHRN_ISCD 8:CNTG_QTY 9:CNTG_UNPR 10:STCK_CNTG_HOUR 11:RFUS_YN 12:CNTG_YN
+                # 13:ACPT_YN 14:BRNC_NO 15:ODER_QTY 16:ACNT_NAME 17:CNTG_ISNM 18:ODER_COND ...
+                # ODER_KIND2가 '0'이면 체결통보(8:체결수량, 9:체결단가), 그 외('L')는 주문·정정·취소·거부
+                # 접수 통보이며 이때 8번 필드는 주문/정정/취소 수량이다.
+                if len(fields) >= 16:
                     return {
-                        "ack_type": "ack_type",  # placeholder, 실제 값은 아래 rfus/cntg/acpt로 결정
                         "cust_id": fields[0],
                         "acnt_no": fields[1],
-                        "order_num": fields[2],           # oder_no
-                        "original_order_num": fields[3],  # ooder_no
-                        "buysell": fields[4],              # seln_byov_cls: 01=매도, 02=매수
-                        "symbol": fields[8] if len(fields) > 8 else "",  # 단축코드
-                        "filled_volume": int(fields[9]) if len(fields) > 9 and fields[9] else 0,   # cntg_qty
-                        "filled_price": float(fields[10]) if len(fields) > 10 and fields[10] else 0.0,  # cntg_unpr
-                        "rfus_yn": fields[12] if len(fields) > 12 else "",  # 거부여부
-                        "cntg_yn": fields[13] if len(fields) > 13 else "",  # 체결여부
-                        "acpt_yn": fields[14] if len(fields) > 14 else "",  # 접수여부
-                        "order_qty": int(fields[16]) if len(fields) > 16 and fields[16] else 0,
+                        "order_num": fields[2],            # ODER_NO
+                        "original_order_num": fields[3],   # OODER_NO
+                        "buysell": fields[4],              # SELN_BYOV_CLS: 01=매도, 02=매수
+                        "rctf_cls": fields[5],             # 정정구분: 0=신규, 1=정정, 2=취소
+                        "order_kind": fields[6],           # ODER_KIND2: '0'=체결통보, 'L'=접수 통보
+                        "symbol": fields[7],               # STCK_SHRN_ISCD
+                        "qty": int(fields[8]) if fields[8] else 0,                # CNTG_QTY (통보 종류별 의미 다름)
+                        "price": float(fields[9]) if fields[9] else 0.0,          # CNTG_UNPR
+                        "filled_time": fields[10],         # STCK_CNTG_HOUR
+                        "rfus_yn": fields[11],             # 거부여부
+                        "cntg_yn": fields[12],             # 체결여부
+                        "acpt_yn": fields[13],             # 접수여부
+                        "order_qty": int(fields[15]) if fields[15] else 0,        # ODER_QTY
                     }
                 logger.warning(f"H0IFCNI0: 필드 개수 부족({len(fields)}) - 원문: {fields}")
                 return None

@@ -59,7 +59,7 @@ class MarketDataHub:
 
     def on_filled(self, filled: FuturesSimpleFilled) -> None:
         if self._loop is None or self._executor is None:
-            raise RuntimeError("MarketDataHub requires injected (loop, executor) in ver2")
+            raise RuntimeError("MarketDataHub requires injected (loop, executor)")
 
         for strategy in self.strategies:
             strategy_id = getattr(strategy, "strategy_id", None) or getattr(strategy, "strategy_name", None)

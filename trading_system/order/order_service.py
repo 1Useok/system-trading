@@ -12,6 +12,7 @@
 """
 
 import datetime
+import logging
 import uuid
 from dataclasses import dataclass
 from typing import Optional
@@ -19,6 +20,8 @@ from typing import Optional
 from trading_system.types.enums import BuySell, PriceType
 from trading_system.order.order_manager import OrderManager
 from trading_system.execution_report.order_registry import OrderRegistry
+
+logger = logging.getLogger(__name__)
 
 
 def _default_client_order_id(prefix: str = "") -> str:
@@ -63,9 +66,13 @@ class OrderService:
         account: Optional[str] = None,
         client_order_id: Optional[str] = None,
         time_in_force: Optional[str] = None,
+        risk_reducing: bool = False,
         **kwargs,
     ):
         """선물 주문을 실행합니다.
+
+        `risk_reducing=True`는 청산/손절처럼 포지션을 줄이는 주문이다. Kill Switch가 발동된
+        상태에서는 이 주문만 통과하고, 나머지는 브로커로 보내지 않고 거부 응답(rt_cd != '0')을 돌려준다.
 
         주의:
         - `broker`는 이미 바인딩되어 있으므로, 전략은 인자로 전달하지 않습니다.
@@ -73,6 +80,13 @@ class OrderService:
           경로로 들어와야 하므로, 주문의 결과는 `NewBrokerConnector`/`KISConnector(enable_ack)`가
           만든 ACK 이벤트를 통해 수신됩니다.
         """
+        kill_switch = getattr(self.order_manager, "kill_switch", None)
+        if kill_switch is not None and not risk_reducing:
+            rejection = kill_switch.rejection()
+            if rejection is not None:
+                logger.warning(f"[OrderService] {self.strategy_id} order blocked by kill switch: {symbol} {side} {quantity}")
+                return rejection
+
         if client_order_id is None:
             client_order_id = _default_client_order_id(self.strategy_id)
 

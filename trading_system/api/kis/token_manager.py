@@ -6,6 +6,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 import aiohttp
+from trading_system.utils.clock import now_kst
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ class KISTokenManager:
         self.is_paper = config.get('is_dev', False)
         
         # 환경에 따른 토큰 파일 설정
-        today = datetime.today().strftime("%Y%m%d")
+        today = now_kst().strftime("%Y%m%d")
         self._token_file = os.path.join(self.token_dir, f"kis_token_{self.svr}_{today}.yaml")
         
         logger.info(f"TokenManager configured: svr={self.svr}, paper_trading={self.is_paper}")
@@ -121,7 +122,7 @@ class KISTokenManager:
             return False
         
         # 만료 10분 전에 갱신
-        buffer_time = datetime.now() + timedelta(minutes=10)
+        buffer_time = now_kst() + timedelta(minutes=10)
         return self.token_expired > buffer_time
     
     def _load_token_from_file(self) -> bool:
@@ -215,7 +216,7 @@ class KISTokenManager:
         
         # 실시간 접속키는 별도로 관리 (24시간 유효)
         if hasattr(self, '_approval_key') and hasattr(self, '_approval_key_expired'):
-            if self._approval_key and datetime.now() < self._approval_key_expired:
+            if self._approval_key and now_kst() < self._approval_key_expired:
                 return self._approval_key
         
         endpoint = self.TOKEN_ENDPOINTS[self.svr]
@@ -246,7 +247,7 @@ class KISTokenManager:
                     raise Exception("Invalid approval key response")
                 
                 # 접속키는 24시간 유효
-                self._approval_key_expired = datetime.now() + timedelta(hours=24)
+                self._approval_key_expired = now_kst() + timedelta(hours=24)
                 
                 logger.info(f"Approval key acquired, expires at: {self._approval_key_expired}")
                 return self._approval_key

@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from enum import Enum
+from trading_system.utils.clock import now_kst
 
 
 class BuySell(Enum):
@@ -29,7 +30,7 @@ class OrderInfo:
     buysell: BuySell
     price: str
     volume: int
-    timestamp: datetime.datetime = field(default_factory=datetime.datetime.now)
+    timestamp: datetime.datetime = field(default_factory=now_kst)
     status: OrderStatus = OrderStatus.PENDING
     filled_volume: int = 0
     filled_price: float = 0.0
@@ -146,7 +147,7 @@ class Book:
             buysell=buysell.value,
             price=closing_price,
             volume=volume,
-            timestamp=datetime.datetime.now(),
+            timestamp=now_kst(),
             strategy_name=self.strategy_name,
             is_closing_exit=True
         )

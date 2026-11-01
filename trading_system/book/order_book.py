@@ -10,8 +10,8 @@ from trading_system.types.events import FuturesSimpleFilled, FuturesSimpleOrderA
 
 from enum import Enum
 import os
-import datetime
 import logging
+from trading_system.utils.clock import now_kst
 
 """
 주문 상태를 나타내는 Enum 클래스
@@ -65,7 +65,7 @@ class Book():
         self.order_book_dict = {}            # 주문 관리 딕셔너리
         self.not_registered_ack = {}         # 미등록 ACK 관리
         # 현재 날짜 가져오기
-        now = datetime.datetime.now()
+        now = now_kst()
         ymd = now.strftime("%Y%m%d")
 
         # ACK 기록 파일 경로 설정 및 생성
@@ -219,7 +219,7 @@ class Book():
             _order_price: 주문 가격
             _order_volume: 주문 수량
         """
-        now = datetime.datetime.now()
+        now = now_kst()
         hms = now.strftime("%H%M%S.%f")
 
         row = hms + ","\
@@ -373,7 +373,7 @@ class Book():
             ack: ACK 정보
             file_name: 기록할 파일 이름
         """
-        now = datetime.datetime.now()
+        now = now_kst()
         hms = now.strftime("%H%M%S.%f")
 
         row = hms + ","\
