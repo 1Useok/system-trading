@@ -169,3 +169,20 @@ def test_execution_report_checkpoint_survives_restart(tmp_path) -> None:
 def test_clock_is_fixed_to_kst_regardless_of_os_timezone() -> None:
     expected = datetime.now(timezone.utc) + timedelta(hours=9)
     assert abs((now_kst() - expected.replace(tzinfo=None)).total_seconds()) < 2
+
+
+def test_kis_future_order_keeps_decimal_price() -> None:
+    from trading_system.api.kis.rest_api import RestApi
+
+    sent = {}
+
+    async def _request_data(tr_id, params, method="POST"):
+        sent.update(params)
+        return {"rt_cd": "0", "output": {"ODNO": "0000001"}}
+
+    api = RestApi.__new__(RestApi)
+    api.request_data = _request_data
+    asyncio.run(api.order_future(account=ACCOUNT, symbol="A01612", quantity=1, price=905.15,
+                                 side=BuySell.BUY, price_type=PriceType.LIMIT))
+    assert sent["UNIT_PRICE"] == "905.15"  # 0.05pt 호가단위: 소수점을 버리면 905.00으로 나간다
+    assert sent["SLL_BUY_DVSN_CD"] == "02"

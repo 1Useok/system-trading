@@ -52,7 +52,6 @@ class RestApi(BaseApi):
         self.base_url = api_config.get('base_url')
         
         self._session = None
-        self._ws = None
         
         # KIS API 엔드포인트 매핑
         self.endpoints = config.get('kis_api_endpoints', {})
@@ -494,7 +493,8 @@ class RestApi(BaseApi):
             "SLL_BUY_DVSN_CD": "02" if side == BuySell.BUY else "01",  # 매도매수구분코드
             "SHTN_PDNO": symbol,              # 단축상품번호 (종목번호)
             "ORD_QTY": str(quantity),         # 주문수량
-            "UNIT_PRICE": str(int(price)) if price_type == PriceType.LIMIT else "0",  # 주문가격 (정수로)
+            # 지수선물 호가단위는 0.05pt라 소수점을 잘라내면 다른 가격으로 주문이 나간다.
+            "UNIT_PRICE": f"{float(price):.2f}" if price_type == PriceType.LIMIT else "0",  # 주문가격
             "NMPR_TYPE_CD": "",               # 호가유형코드 (공란)
             "KRX_NMPR_CNDT_CD": "",           # 한국거래소호가조건코드 (공란)
             "CTAC_TLNO": "",                  # 연락전화번호 (공란)
@@ -522,33 +522,6 @@ class RestApi(BaseApi):
                 logger.warning("현재 선물옵션 운영시간이 아닙니다. 모의투자 환경에서도 운영시간을 확인해주세요.")
             return {"rt_cd": "1", "msg1": str(e)}
 
-    # 실시간 시세/체결 구독 관련 (WebSocket)
-    def subscribe_order(self, callback: Callable[[FuturesSimpleOrderAck], None]) -> None:
-        logger.info("Subscribing to order execution updates")
-        if not self._ws:
-            asyncio.create_task(self._connect_websocket())
-            # WebSocket 구독 로직 구현 필요
-        pass
-
-    def subscribe_quote(self, symbol: str, callback: Callable[[FuturesSimpleQuote], None]) -> None:
-        logger.info(f"Subscribing to quote updates for symbol: {symbol}")
-        if not self._ws:
-            asyncio.create_task(self._connect_websocket())
-        # WebSocket 구독 로직 구현 필요
-        pass
-
-    def unsubscribe_quote(self, symbol: str) -> None:
-        logger.info(f"Unsubscribing quote for symbol: {symbol}")
-        if self._ws:
-            # WebSocket 구독 해제 메시지 전송 로직 필요
-            pass
-
-    def unsubscribe_all(self) -> None:
-        logger.info("Unsubscribing all quotes and closing WebSocket")
-        if self._ws:
-            asyncio.create_task(self._ws.close())
-            self._ws = None
-    
     def _get_order_division_code(self, price_type: PriceType, order_type: OrderType) -> str:
         """주문구분코드 생성"""
         if price_type == PriceType.LIMIT:
@@ -574,15 +547,6 @@ class RestApi(BaseApi):
                 return "15"  # 최유리(FOK)
         return "01"  # 기본값: 지정가
 
-    async def _connect_websocket(self):
-        access_token = await self.token_manager.get_token()
-        logger.info("Establishing WebSocket connection...")
-        self._ws = await self._session.ws_connect(
-            self.ENDPOINTS["websocket"]
-        )
-        logger.info("WebSocket connection established")
-        # WebSocket 연결 후 초기화 처리
-    
     async def inquire_order_history(self, account: str, start_date: str = None, end_date: str = None,
                                    order_status: str = "02", raise_on_error: bool = False) -> List[Dict]:
         """

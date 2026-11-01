@@ -169,7 +169,12 @@ class KISAckConnector:
                   event_id: str, original_order_no: str = "", filled_volume: int = 0,
                   filled_price: float = -1.0, cancel_or_replace_volume: int = 0) -> FuturesSimpleOrderAck:
         # client_order_id 복원: OrderService가 주문 응답의 order_no로 등록해 둔 매핑을 쓴다.
-        client_order_id = self.order_registry.resolve_client_order_id_by_order_no(order_no) or ""
+        # 정정/취소는 새 주문번호로 접수되고 원주문번호가 따로 오므로, 원주문번호로도 찾는다.
+        client_order_id = (
+            self.order_registry.resolve_client_order_id_by_order_no(order_no)
+            or self.order_registry.resolve_client_order_id_by_order_no(original_order_no)
+            or ""
+        )
         strategy_id = self.order_registry.resolve_strategy_id(client_order_id) if client_order_id else None
         return FuturesSimpleOrderAck(
             ack_type=ack_type,

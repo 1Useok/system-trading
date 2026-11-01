@@ -126,6 +126,7 @@ def test_ack_classification_follows_order_kind_and_correction_flags() -> None:
     assert filled.filled_volume == 1 and filled.filled_price == 899.45 and filled.buysell == BuySell.BUY
     assert filled.strategy_id == "MinHighBO" and filled.client_order_id == "CID-1"
     assert canceled.cancel_or_replace_volume == 1
+    assert canceled.strategy_id == "MinHighBO"  # 취소는 새 주문번호로 오지만 원주문번호로 전략을 찾는다
 
 
 def test_same_notice_on_both_channels_is_applied_once() -> None:

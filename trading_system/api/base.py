@@ -81,19 +81,4 @@ class BaseApi(ABC):
     async def cancel_future_order(self, account: str, order_no: str, quantity: int) -> bool:
         pass
 
-    # 실시간 시세/체결 구독 관련
-    @abstractmethod
-    def subscribe_order(self, callback: Callable[[FuturesSimpleOrderAck], None]) -> None:
-        pass
-
-    @abstractmethod
-    def subscribe_quote(self, symbol: str, callback: Callable[[FuturesSimpleQuote], None]) -> None:
-        pass
-
-    @abstractmethod
-    def unsubscribe_quote(self, symbol: str) -> None:
-        pass
-
-    @abstractmethod
-    def unsubscribe_all(self) -> None:
-        pass
+    # 실시간 시세/체결통보(WebSocket)는 `RestStreamer`가 담당한다(REST 클라이언트와 분리).
