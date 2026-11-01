@@ -166,3 +166,35 @@ def test_startup_halts_when_hidden_position_is_reported_twice(monkeypatch) -> No
 def test_startup_ignores_hidden_position_reported_only_once(monkeypatch) -> None:
     stg, _ = _run_startup([_availability(1), _availability(0)], monkeypatch)
     assert not stg.halted
+
+
+def test_executor_circuit_breaker_stops_market_data_but_keeps_acks() -> None:
+    async def _main() -> None:
+        executor = StrategyExecutor(loop=asyncio.get_running_loop(), max_consecutive_failures=3)
+        seen = []
+
+        class _Broken:
+            async def on_quote(self, quote):  # pragma: no cover
+                pass
+
+            async def on_filled(self, filled):
+                seen.append("filled")
+                raise RuntimeError("bug in strategy")
+
+            async def on_ack(self, ack):
+                seen.append("ack")
+
+        executor.register(strategy_id="S", strategy=_Broken())
+        for _ in range(5):
+            await executor.publish_filled(strategy_id="S", filled=tick(100.0))
+            for _ in range(5):
+                await asyncio.sleep(0)
+        await executor.publish_ack(strategy_id="S", ack=FuturesSimpleOrderAck(ack_type=AckType.Filled, strategy_id="S"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert seen == ["filled"] * 3 + ["ack"]  # 3회 연속 실패 후 시세 차단, ACK는 전달
+        assert not executor.is_enabled(strategy_id="S")
+        await executor.shutdown()
+
+    asyncio.run(_main())

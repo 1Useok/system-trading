@@ -47,6 +47,7 @@ graph TD
 | `OrderService` / `OrderManager` | `trading_system/order/` | 전략에 주입되는 브로커 바인딩 주문 서비스 / 브로커별 Driver 레지스트리 |
 | `OrderRegistry` | `trading_system/execution_report/` | `client_order_id ↔ strategy_id`, `order_no ↔ client_order_id` 매핑 (ACK 라우팅의 SSOT) |
 | `KISAckConnector` | `trading_system/execution_report/connectors/` | 체결통보(H0IFCNI0, AES-256-CBC 암호화)를 복호화해 표준 ACK로 변환 |
+| `RiskManager` / `KillSwitch` | `trading_system/risk/` | 손실 한도·수동 발동 감시, 신규 주문 차단 / 미체결 일괄 취소 / 전량 청산 |
 | `StrategyManager` | `trading_system/strategy/` | 구성(composition) 레이어. 위 객체를 만들고 연결하며 전략 생성 시 의존성 주입 |
 
 ---
@@ -88,6 +89,7 @@ graph TD
    - `md_queue`: 크기 제한 있음(기본 1000). 시세가 폭주하면 가장 오래된 것을 버리고 최신값을 유지합니다.
 4. consumer는 ACK를 항상 먼저 처리합니다. 시세가 몰려도 내 주문의 정합성이 우선입니다.
 5. 한 전략의 콜백 예외는 로그로 남기고 격리합니다. 다른 전략과 이후 이벤트 처리는 계속됩니다.
+6. **Circuit breaker:** 같은 전략이 연속으로 예외를 내면(기본 5회) 그 전략에는 시세 전달을 멈춰 새 신호를 차단합니다. ACK는 계속 전달해 주문 상태는 맞춰 둡니다.
 
 ### 4. 설정 기반 브로커 라우팅
 
@@ -104,10 +106,32 @@ execution:
 
 우선순위: `symbol_overrides` → `strategy_overrides` → `default_broker`
 
+### 5. 리스크 관리와 Kill Switch
+
+`KillSwitch`는 `OrderManager`가 소유하고 모든 `OrderService`가 공유합니다. 발동되면 주문 경로 입구에서 차단합니다.
+
+- 리스크를 늘리는 주문은 브로커로 보내지 않고 거부 응답(`rt_cd != '0'`)을 돌려줍니다. 전략은 평소의 주문 거부와 똑같이 처리합니다.
+- 청산·손절처럼 포지션을 줄이는 주문은 `risk_reducing=True`로 표시돼 통과합니다.
+- `RiskManager.trigger()`는 신규 주문 차단 → 미체결 일괄 취소 → (옵션) 보유 포지션 시장가 청산 순서로 실행합니다. 미체결 조회가 실패해도 차단은 유지되고, 조회 실패를 "미체결 없음"으로 해석하지 않습니다.
+- 발동 경로: 실행 디렉터리에 `KILL` 파일 생성(수동), NAV 조회의 평가손익합계가 손실 한도 이하(자동).
+- 한 번 발동되면 프로세스 안에서는 해제하지 않습니다. 원인을 확인한 뒤 재시작해서 풉니다.
+
+### 6. 장애 복구
+
+| 상황 | 대응 |
+| --- | --- |
+| 프로세스 재시작 | 오늘 낸 주문의 `order_no ↔ client_order_id ↔ strategy_id` 매핑을 거래일 단위 JSONL(`state/order_registry_YYYYMMDD.jsonl`)에서 복원. 재시작 전에 낸 주문의 체결통보도 원래 전략으로 갑니다 |
+| 재시작 직후 상태 | 계좌 스냅샷(잔고 + 청산가능수량 교차검증)으로 전략 상태 복원. 확신할 수 없으면 추측성 주문 없이 전략 정지 |
+| 시작 순서 | 상태 복원 → 계좌 스냅샷 → 체결통보 경로 → 시세 경로 → 전략 활성화. 전략이 움직이기 전에 내 주문 결과를 받을 수 있게 합니다 |
+| WebSocket 단절 | 백오프 재연결(1→30초) 후 원래 종목/HTS ID로 재구독. 이어서 REST 주문체결내역의 총체결수량과 비교해, 끊긴 동안 놓친 체결만 Filled ACK로 보정 |
+| DMA 이벤트 재전송 | `event_id`와 (브로커, 계좌)별 `last_seq`를 체크포인트 파일에 저장. 재시작 후 같은 이벤트가 다시 와도 한 번만 반영하고, `resume_seq()`로 replay 시작점을 알 수 있습니다 |
+| 서버 시간대 | 시각 판단은 모두 `utils/clock.py`의 KST(UTC+9 고정) 기준. OS 시간대와 무관 |
+
 ### 토큰 분리 (PROD / VPS)
 
 KIS의 실시간 지수선물 시세 TR_ID(H0IFCNT0/H0IFASP0)는 **실전계좌 전용**이고, 주문·잔고·체결통보는 모의투자 계좌 기준입니다.
 그래서 시세용 토큰(PROD)과 주문용 토큰(VPS)을 분리해 관리합니다. PROD 키가 없으면 REST 폴링만으로 동작합니다.
+WebSocket 엔드포인트도 실전(`:21000`)과 모의(`:31000`)가 달라, 스트리머는 토큰의 서버 구분에 맞는 주소로 접속합니다.
 
 ---
 
@@ -142,6 +166,8 @@ python main.py -v                                 # 모든 모듈 INFO 로그
 ```
 
 - 기본은 **dry-run**입니다. `--send-orders`를 줄 때만 주문이 나가며, 이때 장마감 청산(`KrxExitAll`)도 실제로 주문을 냅니다.
+- 운영 중 즉시 멈추려면 실행 디렉터리에 `KILL` 파일을 만듭니다(예: `touch KILL`). 손실 한도는 `config.yaml`의 `risk.max_loss`입니다.
+- 재시작 복구용 상태는 `state/`에 쌓입니다(git 제외).
 - 종목코드는 `trading_system/config/config.yaml`의 `market_data.kis.subscriptions`에 있습니다. KOSPI200 선물은 분기마다 만기가 돌아오므로 롤오버 때 갱신해야 합니다(현재 `A01612`, 2026년 12월물).
 
 ```bash
@@ -164,6 +190,8 @@ pytest
 | 장마감 청산이 진입 제한 카운터(`bullet`)에 막힘 | 청산·손절은 리스크를 줄이는 동작이므로 `bullet`과 무관하게 항상 실행 |
 | ACK와 시세가 같은 틱에 도착하면 하나가 유실 | `StrategyExecutor`가 완료된 이벤트를 모두 처리하도록 수정 (ACK 우선) |
 | 재시작 시 기존 포지션의 손절/익절 라인 소실 | 시작 시 잔고의 평균체결단가로 전략 상태를 복원 |
+| 체결통보 종류 판별 | 주문종류(`ODER_KIND2`)가 `0`이면 체결, 그 외는 접수 통보이며 정정구분(`RCTF_CLS`)·거부여부(`RFUS_YN`)로 정정/취소/거부를 나눔. 접수 통보의 수량 필드는 주문수량이라 체결로 취급하지 않음 |
+| 모의투자 체결통보 채널 | KIS 자료마다 H0IFCNI0 / H0IFCNI9 표기가 달라 모의 서버에서는 둘 다 구독하고 `event_id`로 한 번만 반영 |
 
 ---
 
@@ -214,18 +242,17 @@ stg_manager.ingest_execution_reports([{
 
 ## 운영 체크리스트
 
-| 항목 | 상태 | 내용 |
-| --- | --- | --- |
-| 중복 주문 방지 | 구현 | 주문마다 `client_order_id` 발급, `OrderRegistry`에 등록 |
-| 주문번호 매핑 | 구현 | `client_order_id ↔ strategy_id ↔ order_no`를 `OrderRegistry` 한 곳에서 관리 |
-| 중복 / 역순 이벤트 | 구현 | `event_id` 중복 제거(KIS·DMA 커넥터), `seq` 역순 차단(DMA 커넥터) |
-| 시작 시 포지션 스냅샷 | 구현 | 잔고조회 + 청산가능수량 교차검증, 불확실하면 전략 정지 |
-| 장마감 청산 | 구현 | `KrxExitAll`, 재시도 창과 교차검증 포함 |
-| 주문 취소 | 구현 | 단건 취소, Kill Switch 발동 시 미체결 일괄 취소 |
-| 부분체결 | 구현 | 체결통보 단위로 누적, 재연결 시 총체결수량과 대사 |
-| Kill Switch | 구현 | 신규 주문 차단 → 미체결 일괄 취소 → (옵션) 전량 청산. 수동(`KILL` 파일) / 손실 한도 자동 발동 |
-| 재연결 후 누락 복구 | 구현 | KIS: 재연결 후 주문체결내역과 대사해 누락 체결 보정. DMA: `last_seq`/`event_id` 체크포인트 |
-| 재시작 복구 | 구현 | 주문 매핑(일 단위 JSONL) 복원 → 계좌 스냅샷 → 체결통보 → 시세 → 전략 활성화 순서 |
+| 항목 | 구현 |
+| --- | --- |
+| 중복 주문 방지 | 주문마다 `client_order_id` 발급, `OrderRegistry`에 등록 |
+| 주문번호 매핑 | `client_order_id ↔ strategy_id ↔ order_no`를 `OrderRegistry` 한 곳에서 관리, 거래일 단위로 파일에 기록 |
+| 중복 / 역순 이벤트 | `event_id` 중복 제거(KIS·DMA 커넥터), `seq` 역순 차단과 체크포인트(DMA 커넥터) |
+| 시작 시 포지션 스냅샷 | 잔고조회 + 청산가능수량 교차검증, 불확실하면 전략 정지 |
+| 장마감 청산 | `KrxExitAll`, 재시도 창과 교차검증 포함 |
+| 주문 취소 | 단건 취소, Kill Switch 발동 시 미체결 일괄 취소 |
+| 부분체결 | 체결통보 단위로 누적, 재연결 시 총체결수량과 대사 |
+| Kill Switch | 신규 주문 차단 → 미체결 일괄 취소 → (옵션) 전량 청산. 수동(`KILL` 파일) / 손실 한도 자동 발동 |
+| 장애 격리 | 전략 콜백 예외 격리, 연속 실패 시 circuit breaker |
 
 ---
 
@@ -240,7 +267,10 @@ trading_system/
   execution_report/            # ExecutionReportRouter, OrderRegistry, 체결통보 커넥터
   order/                       # OrderService, OrderManager, 브로커 Driver, 라우팅 규칙
   strategy/                    # StrategyManager, StrategyExecutor, 샘플 전략
+  risk/                        # KillSwitch, RiskManager
+  utils/                       # KST 시계
   book/                        # 주문 장부 (ACK 기록)
   types/                       # 공통 Enum / 이벤트 타입
-tests/                         # Executor 순서/backpressure, 전략 로직, 안전장치 회귀 테스트
+tests/                         # Executor 순서/backpressure/circuit breaker, KIS 실시간 메시지 해석,
+                               # 전략 로직, Kill Switch, 재시작 복구 테스트
 ```

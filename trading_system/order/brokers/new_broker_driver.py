@@ -72,7 +72,7 @@ class NewBrokerDriver:
             time_in_force,
         )
 
-        # TODO: 실제 전송(HTTP/TCP/MQ/IPC) 구현
+        # dummy 모드: 연동 DMA의 전송 계층(HTTP/TCP/MQ/IPC)이 정해지면 이 지점에서 OrderCommand를 전송한다.
         return {
             "rt_cd": "0",
             "msg1": "DUMMY_OK",
@@ -96,17 +96,14 @@ class NewBrokerDriver:
             order_id,
             client_order_id,
         )
-        # TODO(Phase B 이후): 실제 전송 구현
         return {"rt_cd": "0", "msg1": "DUMMY_OK"}
 
     async def get_future_orders(self, **kwargs) -> Dict[str, Any]:
         logger.info("[NewBrokerDriver] get_future_orders")
-        # TODO(Phase B 이후): 복구/검증용 구현
         return {"rt_cd": "0", "msg1": "DUMMY_OK", "output": []}
 
     async def get_future_account_balance(self, **kwargs) -> Dict[str, Any]:
         logger.info("[NewBrokerDriver] get_future_account_balance")
-        # TODO(Phase B 이후): 시작 시 스냅샷용 구현
         return {"rt_cd": "0", "msg1": "DUMMY_OK", "output": {}}
 
     async def get_future_price(self, **kwargs) -> Dict[str, Any]:

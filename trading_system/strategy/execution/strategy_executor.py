@@ -49,6 +49,7 @@ class _StrategyRuntime:
     ack_queue: asyncio.Queue[StrategyEvent]
     task: asyncio.Task
     enabled: bool = True
+    consecutive_failures: int = 0
 
 
 class StrategyExecutor:
@@ -58,6 +59,8 @@ class StrategyExecutor:
     - 전략별 단일 consumer task → 동일 전략 내부 순차 실행
     - ACK는 drop 금지(별도 큐)
     - Quote/Filled는 backpressure 시 drop/coalesce 가능(기본: 1개 drop 후 최신 유지)
+    - Circuit breaker: 한 전략의 콜백이 연속 `max_consecutive_failures`회 예외를 내면 그 전략에는
+      시세(Quote/Filled) 전달을 멈춰 새 신호를 차단한다. ACK는 계속 전달해 주문 상태는 맞춰 둔다.
     """
 
     def __init__(
@@ -66,8 +69,10 @@ class StrategyExecutor:
         loop: asyncio.AbstractEventLoop,
         quote_queue_size: int = 1000,
         ack_queue_size: int = 0,
+        max_consecutive_failures: int = 5,
     ):
         self._loop = loop
+        self._max_consecutive_failures = max_consecutive_failures
         self._quote_queue_size = quote_queue_size
         self._ack_queue_size = ack_queue_size
         self._runtimes: Dict[str, _StrategyRuntime] = {}
@@ -90,6 +95,10 @@ class StrategyExecutor:
             ack_queue=ack_queue,
             task=task,
         )
+
+    def is_enabled(self, *, strategy_id: str) -> bool:
+        """circuit breaker로 시세 전달이 차단되지 않았는지."""
+        return self._get_runtime(strategy_id).enabled
 
     def is_registered(self, *, strategy_id: str) -> bool:
         return strategy_id in self._runtimes
@@ -194,6 +203,9 @@ class StrategyExecutor:
                         rt.md_queue.task_done()
 
     async def _dispatch(self, *, strategy_id: str, strategy: object, event: StrategyEvent) -> None:
+        rt = self._runtimes.get(strategy_id)
+        if rt is not None and not rt.enabled and not isinstance(event, AckEvent):
+            return  # circuit open: 새 신호의 근거가 되는 시세는 전달하지 않는다
         try:
             if isinstance(event, QuoteEvent):
                 await strategy.on_quote(event.data)
@@ -207,4 +219,15 @@ class StrategyExecutor:
             raise
         except Exception:
             logger.exception("StrategyExecutor: strategy callback failed (strategy_id=%s, event=%s)", strategy_id, getattr(event, "type", "?"))
-            # TODO: 반복 실패 전략에 대한 circuit breaker
+            if rt is not None:
+                rt.consecutive_failures += 1
+                if rt.enabled and rt.consecutive_failures >= self._max_consecutive_failures:
+                    rt.enabled = False
+                    logger.critical(
+                        "StrategyExecutor: circuit open for %s after %d consecutive failures - "
+                        "market data delivery stopped (ACKs still delivered)",
+                        strategy_id, rt.consecutive_failures,
+                    )
+        else:
+            if rt is not None:
+                rt.consecutive_failures = 0
