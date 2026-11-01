@@ -1,0 +1,16 @@
+# Data handling (KIS 잔고 응답 등)
+pandas>=1.5.3,<2.0.0
+numpy>=1.24.3,<2.0.0
+
+# Async HTTP (KIS REST)
+aiohttp>=3.8.0
+
+# Config
+PyYAML>=6.0.0
+python-dotenv>=0.19.0
+
+# KIS WebSocket (실시간 시세 / 체결통보)
+websockets>=10.0.0
+
+# KIS 체결통보(H0IFCNI0) AES-256-CBC 복호화
+pycryptodome>=3.18.0

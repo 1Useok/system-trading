@@ -1,0 +1,26 @@
+# Secrets / credentials (never commit)
+.env
+.tokens/
+
+# Runtime records written by the order books
+trading_system/record/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.idea/
+.vscode/
+*.log

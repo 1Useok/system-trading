@@ -1,0 +1,102 @@
+# 통합 설정 파일
+
+# ===================================================================
+# API 및 계정 정보
+# 실제 API 키와 계정 정보는 반드시 .env 파일에 저장하세요!
+# 보안을 위해 config.yaml에는 API 키를 직접 입력하지 마세요.
+# 
+# 필수 환경변수 (.env 파일에 설정):
+# - KIS_APP_KEY=your_app_key
+# - KIS_APP_SECRET=your_app_secret  
+# - KIS_ACCOUNT_NO=your_account_number
+# - VPS_KIS_APP_KEY=your_vps_app_key (모의투자용)
+# - VPS_KIS_APP_SECRET=your_vps_app_secret (모의투자용)
+# - PROD_KIS_APP_KEY=your_prod_app_key (실전투자용)
+# - PROD_KIS_APP_SECRET=your_prod_app_secret (실전투자용)
+# ===================================================================
+
+# ===================================================================
+# KIS API 엔드포인트 (TR_ID별 경로)
+# ===================================================================
+kis_api_endpoints:
+  # Data Collector (features)
+  FHKIF03020100: "/uapi/domestic-futureoption/v1/quotations/inquire-daily-fuopchartprice"
+  FHKIF03020200: "/uapi/domestic-futureoption/v1/quotations/inquire-time-fuopchartprice"
+  HHDFC05500100: "/uapi/overseas-futureoption/v1/quotations/investor-unpd-trend"
+  HHDDB95030000: "/uapi/overseas-futureoption/v1/quotations/investor-unpd-trend"
+  FHPTJ04040000: "/uapi/domestic-stock/v1/quotations/inquire-investor-daily-by-market"
+  FHPTJ04030000: "/uapi/domestic-stock/v1/quotations/inquire-investor-time-by-market"
+  HHDFC55020400: "/uapi/overseas-futureoption/v1/quotations/inquire-time-futurechartprice"
+  FHPIF05030100: "/uapi/domestic-futureoption/v1/quotations/display-board-callput"
+  FHPIF05020100: "/uapi/domestic-futureoption/v1/quotations/display-board-futures"
+  FHPIF05030200: "/uapi/domestic-futureoption/v1/quotations/display-board-futures"  # 선물전광판
+  FHPKF02010000: "/uapi/domestic-futureoption/v1/quotations/inquire-time-futurechartprice"
+  HHDFC55010000: "/uapi/overseas-futureoption/v1/quotations/inquire-price"
+  HHDFO55020400: "/uapi/overseas-futureoption/v1/quotations/inquire-time-optchartprice"
+  HHDFO55020200: "/uapi/overseas-futureoption/v1/quotations/opt-tick-ccnl"
+  HHDFS76200200: "/uapi/overseas-futureoption/v1/quotations/inquire-daily-price"
+  HHDFS76240200: "/uapi/overseas-futureoption/v1/quotations/inquire-tick"
+  HHDOC55020400: "/uapi/overseas-futureoption/v1/quotations/inquire-time-optionchartprice"
+  
+  # Internal Methods (rest_api.py)
+  VTTC8434R: "/uapi/domestic-stock/v1/trading/inquire-balance"
+  TTTC8434R: "/uapi/domestic-stock/v1/trading/inquire-balance"
+  TTTS3037R: "/uapi/domestic-stock/v1/trading/inquire-ccnl"
+  FHKST01010100: "/uapi/domestic-stock/v1/quotations/inquire-price"
+  TTTC0802U: "/uapi/domestic-stock/v1/trading/order-cash"
+  TTTC0803U: "/uapi/domestic-stock/v1/trading/order-rvsecncl"
+  # 선물옵션 잔고현황
+  CTFO6118R: "/uapi/domestic-futureoption/v1/trading/inquire-balance"  # 실전
+  VTFO6118R: "/uapi/domestic-futureoption/v1/trading/inquire-balance"  # 모의
+  VTTO1101U: "/uapi/domestic-futureoption/v1/trading/order"  # 선물/옵션 주문
+  VTTO1103U: "/uapi/domestic-futureoption/v1/trading/order-rvsecncl"  # 선물/옵션 정정취소
+  VTTO5201R: "/uapi/domestic-futureoption/v1/trading/inquire-ccnl"  # 선물/옵션 주문 조회
+  VTTO5105R: "/uapi/domestic-futureoption/v1/trading/inquire-psbl-order"  # 선물/옵션 주문가능
+  
+  # 선물옵션 시세
+  FHMIF10000000: "/uapi/domestic-futureoption/v1/quotations/inquire-price"  # 선물옵션 시세
+  
+  # 기존 매핑 (호환성)
+  FOAQ00100: "/uapi/domestic-futureoption/v1/trading/inquire-balance"
+  FOAQ00600: "/uapi/domestic-futureoption/v1/trading/inquire-ccnl"
+  FOAQ00200_price: "/uapi/domestic-futureoption/v1/quotations/inquire-price"
+  FOAQ00200_cancel: "/uapi/domestic-futureoption/v1/trading/order-rvsecncl"
+  TTTC0802U_future: "/uapi/domestic-futureoption/v1/trading/order"
+
+# ===================================================================
+# Execution(주문 실행) 라우팅 설정
+# ===================================================================
+# - 전략 코드는 브로커를 선택하지 않음
+# - 라우팅은 설정에서만 결정됨
+execution:
+  # 기본 실행 브로커: kis | new_broker
+  default_broker: kis
+  # KIS 실시간체결통보(H0IFCNI0, KISAckConnector)를 사용할지 여부.
+  # false로 두면 체결/거절 확인을 받을 방법이 없어지므로 특별한 이유가 없으면 켜둘 것.
+  allow_kis_ack: true
+  # 전략별 override (strategy_name -> broker)
+  strategy_overrides: {}
+  # 종목별 override (symbol -> broker)
+  symbol_overrides: {}
+
+# ===================================================================
+# 브로커별 Driver 설정
+# ===================================================================
+# - `kis`는 RestApi가 필요로 하는 전체 config를 OrderManager에 주입하므로,
+#   별도 설정이 없어도 동작합니다.
+# - `new_broker`는 외부 주문 프로그램 연동 설정을 여기에 넣습니다.
+brokers:
+  # kis: {}  # (선택) 별도 설정이 필요하면 확장
+  new_broker:
+    mode: dummy
+
+# ===================================================================
+# Market Data 설정
+# ===================================================================
+market_data:
+  kis:
+    subscriptions:               # 구독할 KIS 단축코드 목록
+      # 2026-11-02 기준 근월물(KOSPI200 선물 2026년 12월물, FHMIF10000000 조회로
+      # 종목명 "F 202612"/최종거래일 2026-12-10 확인). 이전 값 A01609(9월물)는 만기 경과.
+      # 만기 롤오버 시 반드시 재확인/갱신할 것.
+      - "A01612"

@@ -1,0 +1,2 @@
+include README.md
+recursive-include trading_system/config *.yaml
