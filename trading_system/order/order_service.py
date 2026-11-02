@@ -82,9 +82,9 @@ class OrderService:
         """
         kill_switch = getattr(self.order_manager, "kill_switch", None)
         if kill_switch is not None and not risk_reducing:
-            rejection = kill_switch.rejection()
+            rejection = kill_switch.rejection(self.strategy_id)
             if rejection is not None:
-                logger.warning(f"[OrderService] {self.strategy_id} order blocked by kill switch: {symbol} {side} {quantity}")
+                logger.warning(f"[OrderService] {self.strategy_id} order blocked ({rejection['msg1']}): {symbol} {side} {quantity}")
                 return rejection
 
         if client_order_id is None:

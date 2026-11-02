@@ -20,6 +20,15 @@ from .utils.time_utils import calculate_time_list, is_after_market_close
 from trading_system.utils.clock import KST
 
 
+# 기준가 시각 이후 이 시간 안에 첫 체결을 봤으면 정상 시작으로 본다.
+BASE_PRICE_GRACE_SEC = 60
+
+
+def _hms_to_sec(hms) -> int:
+    v = int(hms)
+    return v // 10000 * 3600 + v // 100 % 100 * 60 + v % 100
+
+
 class VolBreakingShort:
     """
     Volatility Breaking Short Strategy Concept.
@@ -55,6 +64,9 @@ class VolBreakingShort:
         self.vol_size: Optional[float] = None
         self.base_price: Optional[float] = None
         self.base_price_recorded = False
+        # 첫 체결을 본 시각(초). 기준가 시각보다 한참 늦게 시작했는데 분봉 복원도 못 했으면
+        # 그때 가격을 기준가로 삼지 않는다(전략 의미가 달라짐).
+        self._first_tick_sec: Optional[int] = None
 
         # Threshold and order parameters
         self.short_threshold = float(param['short_threshold'])
@@ -149,6 +161,13 @@ class VolBreakingShort:
                 if not self.short_order_sent_list[i]:
                     self.short_order_sent_list[i] = True
         else:
+            # 늦게 시작했거나 시세가 끊겼다 돌아오면 지난 슬롯이 한꺼번에 도래한다. 이를 지금 가격으로
+            # 모두 평가하면 시간 분할 진입이 한 시점에 몰리므로, 가장 최근 슬롯만 평가하고 나머지는 건너뛴다.
+            due = [i for i in range(self.short_order_num_divide)
+                   if hms >= self.short_order_time_list[i] and not self.short_order_sent_list[i]]
+            for i in due[:-1]:
+                self.short_order_sent_list[i] = True
+                logging.info(f"{self.strategy_name} Short entry {i} skipped (slot already passed)")
             for i in range(self.short_order_num_divide):
                 if (hms >= self.short_order_time_list[i]
                         and not self.short_order_sent_list[i]
@@ -340,12 +359,19 @@ class VolBreakingShort:
         now = datetime.datetime.now(KST)
         hms = int(now.strftime("%H%M%S"))
 
+        now_sec = _hms_to_sec(hms)
+        if self._first_tick_sec is None:
+            self._first_tick_sec = now_sec
         if (not self.base_price_recorded
                 and hms >= self.base_price_time
                 and self.price is not None):
-            self.base_price = self.price
-            self.base_price_recorded = True
-            logging.info(f"{self.strategy_name} Base price set: {self.base_price}")
+            if self._first_tick_sec - _hms_to_sec(self.base_price_time) > BASE_PRICE_GRACE_SEC:
+                logging.warning(f"{self.strategy_name} 기준가 시각 이후에 시작했고 분봉 복원도 못 해 오늘은 진입하지 않습니다.")
+                self.base_price_recorded = True  # 경고는 한 번만. base_price는 None으로 남아 진입 차단
+            else:
+                self.base_price = self.price
+                self.base_price_recorded = True
+                logging.info(f"{self.strategy_name} Base price set: {self.base_price}")
 
         self._check_min_price()
         self.price = float(filled.price)
@@ -358,6 +384,22 @@ class VolBreakingShort:
             self.best_bid = filled.best_bid
 
         await self._check_and_order()
+
+    def intraday_restore_until(self, now_hms: int) -> Optional[str]:
+        """장중 재시작 시 복원에 필요한 분봉의 마지막 시각(HHMMSS). 복원이 필요 없으면 None."""
+        if self.base_price_recorded or now_hms < self.base_price_time:
+            return None
+        return str(self.base_price_time).zfill(6)
+
+    def restore_intraday(self, bars: List[dict]) -> bool:
+        """오늘 분봉으로 기준가(= `base_price_time` 이후 첫 체결가 ≈ 그 분봉의 시가)를 복원합니다."""
+        for bar in bars:
+            if int(bar["time"]) >= self.base_price_time and bar.get("open"):
+                self.base_price = float(bar["open"])
+                self.base_price_recorded = True
+                logging.info(f"{self.strategy_name} Base price restored from {bar['time']} bar: {self.base_price}")
+                return True
+        return False
 
     async def on_ack(self, ack):
         """Handle order acknowledgment."""

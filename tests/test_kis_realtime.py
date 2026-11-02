@@ -174,3 +174,20 @@ def test_reconcile_matches_rest_order_numbers_padded_with_spaces() -> None:
 
     _feed(connector, _notice(oder_no="0000000729", oder_kind2="0", cntg_qty="1", cntg_unpr="856.80"))
     assert asyncio.run(connector.reconcile_via_rest()) == 0  # 통보로 받은 체결을 REST 행과 같은 주문으로 인식
+
+
+def test_market_data_connector_subscribes_trades_and_order_book() -> None:
+    from trading_system.market_data.connectors.kis_connector import KISConnector
+
+    class _Streamer:
+        def __init__(self):
+            self.subs = []
+
+        async def subscribe(self, symbol, quote_type=QuoteType.TICK, callback=None):
+            self.subs.append((symbol, quote_type))
+            return True
+
+    connector = KISConnector.__new__(KISConnector)
+    connector.streamer, connector.subscribed_symbols, connector.manager = _Streamer(), set(), None
+    asyncio.run(connector.start("A01612"))
+    assert connector.streamer.subs == [("A01612", QuoteType.TICK), ("A01612", QuoteType.ORDERBOOK)]

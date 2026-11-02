@@ -19,6 +19,7 @@ try:
 except Exception:  # pragma: no cover
     RestStreamer = None
 
+from trading_system.types.enums import QuoteType
 from trading_system.types.events import FuturesSimpleFilled, FuturesSimpleQuote
 from trading_system.api.kis.token_manager import KISTokenManager
 
@@ -34,22 +35,27 @@ class KISConnector:
         self.streamer = RestStreamer(token_manager)
         self.subscribed_symbols = set()
 
+    # 체결(틱)과 호가는 KIS에서 별도 TR(H0IFCNT0 / H0IFASP0)이라 각각 구독해야 한다.
+    # 호가를 구독하지 않으면 on_quote 기반 전략(변동성 돌파, 채널 돌파)에 호가가 전혀 오지 않는다.
+    QUOTE_TYPES = (QuoteType.TICK, QuoteType.ORDERBOOK)
+
     async def start(self, symbol: str):
-        try:
-            # NOTE(실서버에서 실제로 확인된 버그): subscribe()가 WebSocket 연결 실패 시
-            # 조용히 반환하기만 해서, 반환값을 확인 안 하면 연결이 안 됐는데도 "Subscribed"
-            # 로그가 찍혀 시세가 들어오는 것처럼 착각하게 된다.
-            ok = await self.streamer.subscribe(symbol, callback=self._on_data)
-            if ok:
-                self.subscribed_symbols.add(symbol)
-                logger.info(f"KISConnector: Subscribed to {symbol}")
-            else:
-                logger.error(
-                    f"KISConnector: Failed to subscribe {symbol} "
-                    f"(WebSocket 연결 실패 - streamer status={self.streamer.status})"
-                )
-        except Exception as e:
-            logger.error(f"KISConnector: Failed to subscribe {symbol}: {e}")
+        for quote_type in self.QUOTE_TYPES:
+            try:
+                # NOTE(실서버에서 실제로 확인된 버그): subscribe()가 WebSocket 연결 실패 시
+                # 조용히 반환하기만 해서, 반환값을 확인 안 하면 연결이 안 됐는데도 "Subscribed"
+                # 로그가 찍혀 시세가 들어오는 것처럼 착각하게 된다.
+                ok = await self.streamer.subscribe(symbol, quote_type=quote_type, callback=self._on_data)
+                if ok:
+                    self.subscribed_symbols.add(symbol)
+                    logger.info(f"KISConnector: Subscribed to {symbol} ({quote_type.name})")
+                else:
+                    logger.error(
+                        f"KISConnector: Failed to subscribe {symbol} ({quote_type.name}) "
+                        f"(WebSocket 연결 실패 - streamer status={self.streamer.status})"
+                    )
+            except Exception as e:
+                logger.error(f"KISConnector: Failed to subscribe {symbol} ({quote_type.name}): {e}")
 
     async def stop(self, symbol: str):
         try:

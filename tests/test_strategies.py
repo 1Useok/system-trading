@@ -184,3 +184,77 @@ def test_vol_breakout_long_uses_prev_day_range_and_order_service_api(monkeypatch
         assert stg.position == 1
 
     asyncio.run(_main())
+
+
+# -----------------------------------------------------------------------------
+# 장중 재시작
+# -----------------------------------------------------------------------------
+BARS = [
+    {"time": "090000", "open": 880.0, "high": 884.0, "low": 879.0, "close": 883.0},
+    {"time": "090100", "open": 883.5, "high": 886.0, "low": 883.0, "close": 885.0},
+    {"time": "092900", "open": 890.0, "high": 897.0, "low": 889.0, "close": 896.0},
+    {"time": "093000", "open": 896.0, "high": 899.0, "low": 895.0, "close": 898.0},  # 채널 고정 이후 봉
+]
+
+
+def _vb(svc, loader, bullet=1, **params):
+    return vbl_mod.VolBreakingLong(
+        "VB", True, ["A01612"], [], ACCOUNT, bullet,
+        {"last_days_ohlc_price": loader.as_prev_day_ohlc_feature()}, {**VB_PARAMS, **params}, svc,
+    )
+
+
+def test_vol_breakout_late_start_restores_base_and_evaluates_only_latest_slot(monkeypatch) -> None:
+    clock = FakeClock("123000")
+    monkeypatch.setattr(vbl_mod, "datetime", clock)
+
+    async def _main() -> None:
+        loader = KISMasterLoader(_FakeRestApi(), request_spacing_sec=0)
+        assert await loader.load(["A01612"])
+        svc = FakeOrderService()
+        stg = _vb(svc, loader, bullet=3, order_volume=3, long_order_num_divide=12)
+
+        assert stg.intraday_restore_until(123000) == "090100"
+        assert stg.restore_intraday(BARS) and stg.base_price == 883.5  # 09:01 봉 시가
+        await stg.on_clock("123000")  # vol_size 20
+
+        await stg.on_filled(tick(894.0))
+        await stg.on_filled(tick(894.0))  # 883.5 + 0.5 * 20 = 893.5 돌파
+        assert len(svc.orders) == 1  # 지난 슬롯 여러 개가 한 시점에 몰려 진입하지 않음
+        assert sum(stg.long_order_sent_list) > 1 and stg.bullet == 2
+
+    asyncio.run(_main())
+
+
+def test_vol_breakout_late_start_without_restore_does_not_trade(monkeypatch) -> None:
+    clock = FakeClock("123000")
+    monkeypatch.setattr(vbl_mod, "datetime", clock)
+
+    async def _main() -> None:
+        loader = KISMasterLoader(_FakeRestApi(), request_spacing_sec=0)
+        assert await loader.load(["A01612"])
+        svc = FakeOrderService()
+        stg = _vb(svc, loader)
+        await stg.on_clock("123000")
+        for _ in range(3):
+            await stg.on_filled(tick(950.0))
+        assert stg.base_price is None and svc.orders == []  # 12:30 가격을 기준가로 쓰지 않는다
+
+    asyncio.run(_main())
+
+
+def test_channel_breakout_late_start_restores_channel_from_minute_bars(monkeypatch) -> None:
+    clock = FakeClock("103000")
+    monkeypatch.setattr(cb_mod, "datetime", clock)
+
+    async def _main() -> None:
+        svc = FakeOrderService()
+        stg = _cb(svc, bullet=2)
+        assert stg.intraday_restore_until(103000) == "093000"
+        assert stg.restore_intraday(BARS)
+        assert stg.high_price == 897.0 and stg.low_price == 879.0  # 09:30 봉은 채널에 넣지 않음
+
+        await stg.on_filled(tick(897.5, high=899.0))
+        assert stg.long_flag and svc.orders and svc.orders[0]["side"] == BuySell.BUY
+
+    asyncio.run(_main())

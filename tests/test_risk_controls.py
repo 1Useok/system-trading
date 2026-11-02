@@ -228,3 +228,58 @@ def test_order_numbers_match_across_kis_formats() -> None:
     registry.register(client_order_id="CID-9", strategy_id="S")
     registry.register_order_no(order_no="0000000729", client_order_id="CID-9")  # 주문 응답 / 체결통보 형식
     assert registry.resolve_client_order_id_by_order_no("       729") == "CID-9"  # 주문체결내역 조회 형식
+
+
+def test_blocked_strategy_cannot_enter_but_can_exit_and_others_trade() -> None:
+    svc, driver, manager = _order_service()
+    other = manager.for_broker("fake", strategy_id="Other", order_registry=OrderRegistry())
+    manager.kill_switch.block_entries("S", "existing position on restart")
+
+    assert _order(svc)["rt_cd"] != "0"
+    assert _order(svc, side=BuySell.SELL, risk_reducing=True)["rt_cd"] == "0"
+    assert _order(other)["rt_cd"] == "0"
+    assert len(driver.orders) == 2 and not manager.kill_switch.active
+
+
+def test_restart_with_unrestorable_position_blocks_that_strategy() -> None:
+    import main
+    from types import SimpleNamespace
+
+    def _run(positions, restorable=False):
+        ks = KillSwitch()
+        mgr = SimpleNamespace(order_manager=SimpleNamespace(kill_switch=ks))
+        main._guard_unrestorable_position(mgr, SimpleNamespace(strategy_name="VolBO_Long"), "A01612",
+                                          positions, restorable)
+        return ks.is_blocked("VolBO_Long")
+
+    assert _run([("A01612", 1)])
+    assert _run(None)  # 계좌 상태를 모르면 막는다
+    assert not _run([])
+    assert not _run([("A05603", -1)])  # 다른 종목
+    assert not _run([("A01612", 1)], restorable=True)  # 포지션을 이어받는 전략
+
+
+def test_streamer_retries_flaky_handshake(monkeypatch) -> None:
+    import trading_system.api.kis.rest_streamer as rs
+
+    attempts = []
+
+    async def _connect(url):
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise ConnectionError("did not receive a valid HTTP response")
+        return object()
+
+    async def _noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(rs.websockets, "connect", _connect)
+    streamer = rs.RestStreamer(type("TM", (), {"svr": "vps"})())
+    streamer.RECONNECT_BACKOFF_SEC = (0,)
+    monkeypatch.setattr(streamer, "_authenticate", _noop)
+    monkeypatch.setattr(streamer, "_message_handler", _noop)
+
+    async def _main():
+        return await streamer.connect()
+
+    assert asyncio.run(_main()) and len(attempts) == 2

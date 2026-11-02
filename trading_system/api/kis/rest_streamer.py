@@ -27,6 +27,7 @@ class RestStreamer:
     WS_URL_PROD = os.getenv("KIS_WS_URL", "ws://ops.koreainvestment.com:21000")
     WS_URL_VPS = os.getenv("KIS_WS_URL_VPS", "ws://ops.koreainvestment.com:31000")
 
+    CONNECT_ATTEMPTS = 5  # 최초 접속 시도 횟수(백오프 1+2+5+10초). 직전 세션이 정리되기 전 재접속은 몇 초간 거부된다
     RECONNECT_BACKOFF_SEC = (1, 2, 5, 10, 30)
 
     def __init__(self, token_manager: 'KISTokenManager'):
@@ -52,21 +53,28 @@ class RestStreamer:
     def status(self) -> StreamerStatus:
         return self._status
 
-    async def connect(self) -> bool:
+    async def connect(self, attempts: int = CONNECT_ATTEMPTS) -> bool:
+        """접속합니다. KIS 서버는 핸드셰이크를 간헐적으로 끊으므로(장중 실측) 짧은 백오프로 재시도한다."""
         if self._status == StreamerStatus.CONNECTED:
             return True
-        self._status = StreamerStatus.CONNECTING
-        try:
-            self._ws = await websockets.connect(self.ws_url)
-            await self._authenticate()
-            self._status = StreamerStatus.CONNECTED
-            asyncio.create_task(self._message_handler())
-            logger.info(f"WebSocket connection established ({self.ws_url}).")
-            return True
-        except Exception as e:
-            self._status = StreamerStatus.ERROR
-            logger.exception(f"WebSocket connection failed: {e}")
-            return False
+        for attempt in range(1, attempts + 1):
+            self._status = StreamerStatus.CONNECTING
+            try:
+                self._ws = await websockets.connect(self.ws_url)
+                await self._authenticate()
+                self._status = StreamerStatus.CONNECTED
+                asyncio.create_task(self._message_handler())
+                logger.info(f"WebSocket connection established ({self.ws_url}).")
+                return True
+            except Exception as e:
+                self._status = StreamerStatus.ERROR
+                if attempt == attempts:
+                    logger.error(f"WebSocket connection failed after {attempts} attempts ({self.ws_url}): {e}")
+                    return False
+                delay = self.RECONNECT_BACKOFF_SEC[min(attempt - 1, len(self.RECONNECT_BACKOFF_SEC) - 1)]
+                logger.warning(f"WebSocket connection failed ({attempt}/{attempts}), retry in {delay}s: {e}")
+                await asyncio.sleep(delay)
+        return False
 
     async def _authenticate(self):
         # 선물옵션은 approval_key를 사용 (실시간 접속키)
@@ -239,7 +247,7 @@ class RestStreamer:
             delay = self.RECONNECT_BACKOFF_SEC[min(attempt, len(self.RECONNECT_BACKOFF_SEC) - 1)]
             logger.warning(f"WebSocket disconnected. Reconnecting in {delay}s (attempt {attempt + 1})...")
             await asyncio.sleep(delay)
-            if await self.connect():
+            if await self.connect(attempts=1):  # 백오프는 이 루프가 담당
                 break
             attempt += 1
         if self._closing:

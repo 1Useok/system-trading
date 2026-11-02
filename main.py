@@ -25,8 +25,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from trading_system.book.positions import extract_positions
 from trading_system.config.config_loader import ConfigLoader
 from trading_system.market_data.connectors.kis_master_loader import KISMasterLoader
 from trading_system.risk.risk_manager import RiskManager
@@ -140,12 +141,56 @@ async def _clock_scheduler(stg_manager: StrategyManager, interval_sec: float = 1
 # -----------------------------------------------------------------------------
 # 시작 점검 (재시작 시 기존 포지션 확인)
 # -----------------------------------------------------------------------------
+async def _restore_intraday_state(stg_manager: StrategyManager, strategy, inst_code: str) -> None:
+    """장중에 시작했으면 오늘 분봉으로 전략의 장중 기준값(변동성 돌파 기준가, 채널 고가/저가)을 복원합니다.
+
+    복원하지 못하면 전략은 늦게 본 가격을 기준값으로 쓰지 않고 그날 진입을 하지 않습니다.
+    """
+    until = getattr(strategy, "intraday_restore_until", None)
+    until_hour = until(int(now_kst().strftime("%H%M%S"))) if until else None
+    if not until_hour or stg_manager.rest_api is None:
+        return
+    try:
+        bars = await stg_manager.rest_api.get_future_minute_bars(inst_code, until_hour)
+    except Exception as e:
+        logger.warning(f"[STARTUP] 분봉 조회 실패 - 장중 기준값을 복원하지 못했습니다: {e}")
+        return
+    finally:
+        await asyncio.sleep(AVAILABILITY_CHECK_SPACING_SEC)
+    if strategy.restore_intraday(bars):
+        logger.info(f"[STARTUP] 장중 기준값 복원 완료 ({len(bars)} bars until {until_hour})")
+    else:
+        logger.warning(f"[STARTUP] 분봉에 {until_hour} 이전 데이터가 없어 장중 기준값을 복원하지 못했습니다.")
+
+
+def _guard_unrestorable_position(stg_manager: StrategyManager, strategy, inst_code: str,
+                                 positions: Optional[List[Tuple[str, int]]], restorable: bool) -> None:
+    """재시작 직후 전략이 이어받을 수 없는 포지션이 있으면 그 전략의 신규 진입을 막습니다.
+
+    진입 횟수/수량 같은 장중 상태는 메모리에만 있어서, 포지션 상태를 복원하지 못하는 전략은 재시작하면
+    이미 진입한 사실을 모르고 같은 신호로 다시 진입한다. 기존 포지션은 KrxExitAll 장마감 청산이 정리한다.
+    """
+    if strategy is None or restorable:
+        return
+    if positions is None:
+        reason = "계좌 포지션을 확인하지 못함"
+    elif any(symbol == inst_code and qty != 0 for symbol, qty in positions):
+        reason = f"재시작 시 {inst_code} 기존 포지션 보유({dict(positions).get(inst_code)})"
+    else:
+        return
+    stg_manager.order_manager.kill_switch.block_entries(strategy.strategy_name, reason)
+
+
 async def _reconcile_positions_on_startup(
     stg_manager: StrategyManager,
     account: str,
     breakout_strategy: Optional[MinuteHighBreakoutStrategy] = None,
-) -> None:
+    *,
+    inst_code: Optional[str] = None,
+) -> Optional[List[Tuple[str, int]]]:
     """기존 보유 포지션을 조회해 로그로 남기고, 가능하면 전략 상태를 복원합니다.
+
+    반환값은 확인된 보유 포지션 `[(symbol, net_qty)]`이고, 계좌 상태를 확신할 수 없으면 None입니다.
 
     `breakout_strategy`가 주어지고 그 종목에 매수(롱) 포지션이 있으면 실제 평균체결단가
     (`ccld_avg_unpr1`)로 `long_flag`/`entry_price`를 복원해 재시작 후에도 손절/익절 추적이
@@ -155,11 +200,12 @@ async def _reconcile_positions_on_startup(
     두 API가 상충하거나 교차검증 자체가 실패하면 추측성 주문 대신 전략을 halted로 멈춥니다.
     """
     if stg_manager.rest_api is None:
-        return
+        return []
+    inst_code = inst_code or getattr(breakout_strategy, "inst_code", None)
     try:
         balance, summary = await stg_manager.rest_api.get_future_account_balance(account=account)
 
-        if (not hasattr(balance, "empty") or balance.empty) and breakout_strategy is not None:
+        if (not hasattr(balance, "empty") or balance.empty) and inst_code:
 
             async def _check_availability() -> Dict[str, Any]:
                 result: Dict[str, Any] = {}
@@ -168,7 +214,7 @@ async def _reconcile_positions_on_startup(
                     try:
                         result = await stg_manager.rest_api.check_future_order_availability(
                             account=account,
-                            symbol=breakout_strategy.inst_code,
+                            symbol=inst_code,
                             side=BuySell.SELL,
                             price=0,
                             order_type="02",
@@ -182,10 +228,10 @@ async def _reconcile_positions_on_startup(
             def _halt(reason: str) -> None:
                 logger.error(
                     f"[STARTUP] {reason} 실제 상태를 확신할 수 없으므로 추측성 주문 대신 "
-                    f"{breakout_strategy.strategy_name}을 정지(halted)시킵니다. "
-                    "계좌 상태를 수동으로 확인한 뒤 재시작하세요."
+                    "전략을 정지시킵니다. 계좌 상태를 수동으로 확인한 뒤 재시작하세요."
                 )
-                breakout_strategy.halted = True
+                if breakout_strategy is not None:
+                    breakout_strategy.halted = True
 
             # 보유 포지션 판단은 청산가능수량(liquidation_possible_qty, lqd_psbl_qty1)으로 한다.
             # total_possible_qty(tot_psbl_qty)는 신규 주문 가능 수량을 포함해 플랫 계좌에서도
@@ -239,8 +285,10 @@ async def _reconcile_positions_on_startup(
                         )
         else:
             logger.info(f"[STARTUP] 기존 보유 포지션 없음 {summary}")
+        return extract_positions((balance, summary))
     except Exception as e:
         logger.error(f"[STARTUP] 포지션 조회 실패: {e}")
+        return None
 
 
 # -----------------------------------------------------------------------------
@@ -334,6 +382,7 @@ async def main(strategy_name: str, send_orders: bool, inst_code: Optional[str]) 
     )
 
     strategy = await _build_strategy(strategy_name, stg_manager, inst_code, account, send_orders)
+    await _restore_intraday_state(stg_manager, strategy, inst_code)
     exit_all = stg_manager.build_strategy(
         KrxExitAll, "KRX_ExitAll", send_orders, [inst_code], [EXIT_ALL_TIME], {inst_code: account},
         1, {}, {"exit_time": EXIT_ALL_TIME}, "kis",
@@ -353,11 +402,14 @@ async def main(strategy_name: str, send_orders: bool, inst_code: Optional[str]) 
     )
 
     # 2) 계좌 스냅샷: 기존 포지션 확인과 전략 상태 복원 (REST 폴링 시작 전에 끝내야 요청 제한에 안 걸림)
-    await _reconcile_positions_on_startup(stg_manager, account, breakout_strategy=breakout)
+    positions = await _reconcile_positions_on_startup(stg_manager, account, breakout, inst_code=inst_code)
     await asyncio.sleep(AVAILABILITY_CHECK_SPACING_SEC)
+    _guard_unrestorable_position(stg_manager, strategy, inst_code, positions, restorable=breakout is not None)
 
     # 3) 체결통보 경로를 시세보다 먼저 연다: 전략이 움직이기 전에 내 주문 결과를 받을 수 있어야 한다.
-    await stg_manager.start_kis_ack()
+    #    통보 없이 주문을 내면 체결/취소를 모른 채 같은 신호로 다시 주문할 수 있으므로, 못 열면 신규 주문을 막는다.
+    if not await stg_manager.start_kis_ack() and send_orders:
+        stg_manager.order_manager.kill_switch.activate("execution notice stream unavailable at startup")
 
     # 4) 시세 경로
     prod_cfg = cfg.get("prod_api", {})

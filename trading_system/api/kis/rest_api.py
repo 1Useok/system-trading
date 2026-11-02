@@ -464,6 +464,38 @@ class RestApi(BaseApi):
             logger.error(f"Error fetching future price: {e}")
             return {}
 
+    async def get_future_minute_bars(self, symbol: str, until_hour: str, market_code: str = "F") -> List[Dict[str, Any]]:
+        """오늘 1분봉을 `until_hour`(HHMMSS) 이전 최대 약 100개까지 시간순으로 돌려줍니다(`FHKIF03020200`).
+
+        봉의 `time`은 그 분의 시작 시각입니다(08:45 봉의 시가 = 당일 시가).
+        장중에 재시작했을 때 전략의 장중 기준값(기준가, 채널)을 복원하는 데 씁니다.
+        """
+        params = {
+            "FID_COND_MRKT_DIV_CODE": market_code,
+            "FID_INPUT_ISCD": symbol,
+            "FID_HOUR_CLS_CODE": "60",       # 봉 간격(초)
+            "FID_PW_DATA_INCU_YN": "N",      # 과거 데이터 포함 여부
+            "FID_FAKE_TICK_INCU_YN": "N",    # 허봉 포함 여부
+            "FID_INPUT_DATE_1": now_kst().strftime("%Y%m%d"),
+            "FID_INPUT_HOUR_1": str(until_hour).zfill(6),
+        }
+        result = await self.request_data("FHKIF03020200", params, method="GET")
+        if result.get("rt_cd") != "0":
+            raise RuntimeError(f"KIS API error (FHKIF03020200): {result.get('msg1')}")
+        bars = [
+            {
+                "time": str(r.get("stck_cntg_hour", "")),
+                "open": float(r.get("futs_oprc") or 0),
+                "high": float(r.get("futs_hgpr") or 0),
+                "low": float(r.get("futs_lwpr") or 0),
+                "close": float(r.get("futs_prpr") or 0),
+                "volume": int(float(r.get("cntg_vol") or 0)),
+            }
+            for r in result.get("output2") or []
+            if r.get("stck_bsop_date") == params["FID_INPUT_DATE_1"]
+        ]
+        return sorted(bars, key=lambda b: b["time"])
+
     async def get_future_daily_ohlc(self, symbol: str, market_code: str = "F") -> Dict[str, float]:
         """선물 전일(가장 최근 완결된 거래일) OHLC를 조회합니다.
 

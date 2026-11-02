@@ -20,6 +20,7 @@ import datetime
 import logging
 from trading_system.book.order_book import Book
 import math
+from typing import List, Optional
 from trading_system.utils.clock import KST
 
 
@@ -509,6 +510,22 @@ class CBSplitLongOnlyPct(Strategy):
 
         return None
 
+
+    def intraday_restore_until(self, now_hms: int) -> Optional[str]:
+        """장중 재시작 시 복원에 필요한 분봉의 마지막 시각(HHMMSS). 채널이 이미 잡혔거나 고정 전이면 None."""
+        if self.high_price is not None or now_hms <= int(self.channel_fix_time):
+            return None
+        return str(self.channel_fix_time).zfill(6)
+
+    def restore_intraday(self, bars: List[dict]) -> bool:
+        """채널 고정 시각 전에 시작하지 못했으면 오늘 분봉으로 그때까지의 고가/저가(채널)를 복원합니다."""
+        window = [b for b in bars if int(b["time"]) < int(self.channel_fix_time) and b.get("high")]
+        if not window:
+            return False
+        self.high_price = max(float(b["high"]) for b in window)
+        self.low_price = min(float(b["low"]) for b in window)
+        logging.info(f"{self.strategy_name} channel restored from {len(window)} bars: high={self.high_price} low={self.low_price}")
+        return True
 
     async def on_ack(self, ack):
         """
