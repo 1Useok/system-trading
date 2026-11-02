@@ -16,6 +16,18 @@ from trading_system.utils.clock import now_kst
 
 logger = logging.getLogger(__name__)
 
+
+# 초당 거래건수 제한(EGW00201). 거부된 요청은 처리되지 않았으므로 주문도 재시도해도 중복되지 않는다.
+RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_BACKOFF_SEC = 1.1
+
+
+def _is_rate_limited(result: Dict[str, Any]) -> bool:
+    if not isinstance(result, dict) or result.get("rt_cd") in ("0", "", None):
+        return False
+    return result.get("msg_cd") == "EGW00201" or "초당 거래건수" in str(result.get("msg1") or "")
+
+
 class RestApi(BaseApi):
     """한국투자증권 REST API 단일 구현체"""
 
@@ -82,6 +94,16 @@ class RestApi(BaseApi):
         return await self.token_manager.get_token()
 
     async def request_data(self, tr_id: str, params: Dict[str, Any], method: str = "POST") -> Dict[str, Any]:
+        """KIS REST 호출. 초당 거래건수 초과(EGW00201) 응답은 처리되지 않은 요청이므로 잠시 쉬고 재시도한다."""
+        for attempt in range(RATE_LIMIT_RETRIES + 1):
+            result = await self._request_once(tr_id, params, method)
+            if not _is_rate_limited(result) or attempt == RATE_LIMIT_RETRIES:
+                return result
+            logger.warning(f"Rate limited - TR_ID: {tr_id}, retry {attempt + 1}/{RATE_LIMIT_RETRIES}")
+            await asyncio.sleep(RATE_LIMIT_BACKOFF_SEC)
+        return result
+
+    async def _request_once(self, tr_id: str, params: Dict[str, Any], method: str = "POST") -> Dict[str, Any]:
         if not self._session:
             await self.is_connected()
         

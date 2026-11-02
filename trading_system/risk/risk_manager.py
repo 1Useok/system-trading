@@ -21,6 +21,31 @@ from trading_system.types.enums import BuySell, PriceType
 logger = logging.getLogger(__name__)
 
 
+
+def working_orders(rows) -> list:
+    """미체결 조회 결과에서 실제로 시장에 걸려 있는(취소할 수 있는) 주문만 고릅니다.
+
+    KIS 미체결 조회에는 처리 중인 취소주문 자체도 잔량과 함께 나오므로(`trad_dvsn_name`='매수취소'),
+    이를 제외하지 않으면 취소주문을 다시 취소하려 하게 된다.
+    """
+    out = []
+    for row in rows or []:
+        try:
+            remaining = int(float(row.get("qty") or 0))  # 잔량
+        except (TypeError, ValueError):
+            remaining = 0
+        if not str(row.get("odno") or "").strip() or remaining <= 0:
+            continue
+        if "취소" in str(row.get("trad_dvsn_name") or ""):
+            continue
+        out.append(row)
+    return out
+
+
+def _accepted(rsp) -> bool:
+    """브로커 응답 형태(주문: `rt_cd`, KIS 취소: `success`)와 무관하게 접수 여부를 판정합니다."""
+    return isinstance(rsp, dict) and (rsp.get("rt_cd") == "0" or rsp.get("success") is True)
+
 class RiskManager:
     def __init__(
         self,
@@ -99,18 +124,12 @@ class RiskManager:
         """
         open_orders = await self.rest_api.inquire_order_history(self.account, order_status="02", raise_on_error=True)
         accepted = 0
-        for row in open_orders or []:
+        for row in working_orders(open_orders):
             order_no = str(row.get("odno") or "").strip()
-            try:
-                remaining = int(float(row.get("qty") or 0))  # 잔량
-            except (TypeError, ValueError):
-                remaining = 0
-            if not order_no or remaining <= 0:
-                continue
             rsp = await self.order_service.cancel_future_order(
                 order_id=order_no, account=self.account, symbol=str(row.get("pdno") or ""), quantity=0,
             )
-            if isinstance(rsp, dict) and rsp.get("rt_cd") == "0":
+            if _accepted(rsp):
                 accepted += 1
             else:
                 logger.error(f"[RISK] 취소 실패 order_no={order_no}: {rsp}")
@@ -131,7 +150,7 @@ class RiskManager:
                 time_in_force="DAY",
                 risk_reducing=True,
             )
-            if isinstance(rsp, dict) and rsp.get("rt_cd") == "0":
+            if _accepted(rsp):
                 accepted += 1
             else:
                 logger.error(f"[RISK] 청산 실패 {symbol} {net_qty}: {rsp}")

@@ -163,3 +163,14 @@ def test_reconcile_after_reconnect_fills_only_the_missing_quantity() -> None:
     assert gap.ack_type == AckType.Filled and gap.filled_volume == 2 and gap.filled_price == 900.10
     assert gap.strategy_id == "VolBO_Long"
     assert asyncio.run(connector.reconcile_via_rest()) == 0  # 이미 보정됨
+
+
+def test_reconcile_matches_rest_order_numbers_padded_with_spaces() -> None:
+    rows = [{"odno": "       729", "orgn_odno": "", "pdno": "A01612", "sll_buy_dvsn_cd": "02",
+             "tot_ccld_qty": "1", "avg_idx": "856.80"}]
+    connector, router, registry = _connector(rest_api=_OrderHistoryApi(rows))
+    registry.register(client_order_id="CID-7", strategy_id="LiveTest")
+    registry.register_order_no(order_no="0000000729", client_order_id="CID-7")
+
+    _feed(connector, _notice(oder_no="0000000729", oder_kind2="0", cntg_qty="1", cntg_unpr="856.80"))
+    assert asyncio.run(connector.reconcile_via_rest()) == 0  # 통보로 받은 체결을 REST 행과 같은 주문으로 인식

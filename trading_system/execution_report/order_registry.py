@@ -34,6 +34,16 @@ from trading_system.utils.clock import now_kst
 logger = logging.getLogger(__name__)
 
 
+def normalize_order_no(order_no) -> str:
+    """브로커 주문번호를 비교 가능한 형태로 맞춥니다.
+
+    KIS는 같은 주문번호를 주문 응답/체결통보에서는 `0000000729`, 주문체결내역 조회에서는
+    `'       729'`처럼 다르게 돌려주므로, 공백과 앞자리 0을 떼고 비교합니다.
+    """
+    s = str(order_no or "").strip()
+    return s.lstrip("0") or ("0" if s else "")
+
+
 @dataclass
 class OrderRegistryEntry:
     client_order_id: str
@@ -77,7 +87,7 @@ class OrderRegistry:
                         client_order_id=rec["client_order_id"], strategy_id=rec["strategy_id"],
                     )
                 elif rec.get("t") == "ono":
-                    self._order_no_to_client_order_id[rec["order_no"]] = rec["client_order_id"]
+                    self._order_no_to_client_order_id[normalize_order_no(rec["order_no"])] = rec["client_order_id"]
                 loaded += 1
         logger.info(f"OrderRegistry: {loaded} records restored from {self._store_path}")
 
@@ -121,7 +131,7 @@ class OrderRegistry:
         if not order_no or not client_order_id:
             return
         with self._lock:
-            self._order_no_to_client_order_id[str(order_no)] = client_order_id
+            self._order_no_to_client_order_id[normalize_order_no(order_no)] = client_order_id
             self._append({"t": "ono", "order_no": str(order_no), "client_order_id": client_order_id})
 
     def resolve_client_order_id_by_order_no(self, order_no: str) -> Optional[str]:
@@ -129,4 +139,4 @@ class OrderRegistry:
         if not order_no:
             return None
         with self._lock:
-            return self._order_no_to_client_order_id.get(str(order_no))
+            return self._order_no_to_client_order_id.get(normalize_order_no(order_no))

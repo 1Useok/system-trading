@@ -186,3 +186,45 @@ def test_kis_future_order_keeps_decimal_price() -> None:
                                  side=BuySell.BUY, price_type=PriceType.LIMIT))
     assert sent["UNIT_PRICE"] == "905.15"  # 0.05pt 호가단위: 소수점을 버리면 905.00으로 나간다
     assert sent["SLL_BUY_DVSN_CD"] == "02"
+
+
+def test_kis_request_retries_when_rate_limited(monkeypatch) -> None:
+    import trading_system.api.kis.rest_api as rest_api_module
+    from trading_system.api.kis.rest_api import RestApi
+
+    replies = [{"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다."},
+               {"rt_cd": "0", "output": {"ODNO": "0000001"}}]
+    calls = []
+
+    async def _request_once(tr_id, params, method="POST"):
+        calls.append(tr_id)
+        return replies[len(calls) - 1]
+
+    monkeypatch.setattr(rest_api_module, "RATE_LIMIT_BACKOFF_SEC", 0)
+    api = RestApi.__new__(RestApi)
+    api._request_once = _request_once
+    assert asyncio.run(api.request_data("VTTO1103U", {}))["rt_cd"] == "0"
+    assert calls == ["VTTO1103U", "VTTO1103U"]
+
+
+def test_cancel_all_skips_pending_cancel_orders_and_counts_kis_cancel_success() -> None:
+    svc, driver, manager = _order_service()
+
+    async def _cancel(**params):
+        driver.cancels.append(params)
+        return {"success": True, "order_no": "0000000760"}  # KIS 취소 응답 형태
+
+    driver.cancel_future_order = _cancel
+    api = _OpenOrdersApi(rows=[
+        {"odno": "       729", "pdno": "A01612", "qty": "1", "trad_dvsn_name": "매수"},
+        {"odno": "       760", "orgn_odno": "       729", "pdno": "A01612", "qty": "1", "trad_dvsn_name": "매수취소"},
+    ])
+    assert asyncio.run(_risk(svc, manager, api).cancel_all()) == 1
+    assert [c["order_id"] for c in driver.cancels] == ["729"]
+
+
+def test_order_numbers_match_across_kis_formats() -> None:
+    registry = OrderRegistry()
+    registry.register(client_order_id="CID-9", strategy_id="S")
+    registry.register_order_no(order_no="0000000729", client_order_id="CID-9")  # 주문 응답 / 체결통보 형식
+    assert registry.resolve_client_order_id_by_order_no("       729") == "CID-9"  # 주문체결내역 조회 형식

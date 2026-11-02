@@ -19,7 +19,7 @@ from typing import Any, Dict, Optional, Set
 
 from trading_system.types.enums import AckType, BuySell, QuoteType
 from trading_system.types.events import FuturesSimpleOrderAck
-from trading_system.execution_report.order_registry import OrderRegistry
+from trading_system.execution_report.order_registry import OrderRegistry, normalize_order_no
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +117,7 @@ class KISAckConnector:
         if ack.event_id:
             self._seen_event_ids.add(ack.event_id)
         if ack.ack_type == AckType.Filled:
-            self._filled_qty[ack.order_num] += int(ack.filled_volume)
+            self._filled_qty[normalize_order_no(ack.order_num)] += int(ack.filled_volume)
 
         if self.manager:
             self.manager.on_ack(ack)
@@ -220,13 +220,13 @@ class KISAckConnector:
                 avg_price = float(row.get("avg_idx") or 0.0)
             except (TypeError, ValueError):
                 continue
-            missing = total_filled - self._filled_qty[order_no]
+            missing = total_filled - self._filled_qty[normalize_order_no(order_no)]
             if missing <= 0:
                 continue
             self._dispatch(self._make_ack(
                 ack_type=AckType.Filled,
                 order_no=order_no,
-                original_order_no=str(row.get("orgn_odno") or ""),
+                original_order_no=str(row.get("orgn_odno") or "").strip(),
                 symbol=str(row.get("pdno") or ""),
                 buysell=_to_buysell(row.get("sll_buy_dvsn_cd")),
                 filled_volume=missing,
