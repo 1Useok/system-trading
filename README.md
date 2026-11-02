@@ -282,3 +282,7 @@ trading_system/
 tests/                         # Executor 순서/backpressure/circuit breaker, KIS 실시간 메시지 해석,
                                # 전략 로직, Kill Switch, 재시작 복구 테스트
 ```
+
+## 이용 조건
+
+포트폴리오 검토용으로 공개한 저장소입니다. 코드와 문서의 복제, 수정, 재배포, 상업적 이용 및 실거래 사용을 허락하지 않습니다. 자세한 내용은 [LICENSE](LICENSE)를 참고하세요.
