@@ -72,7 +72,8 @@ def test_streamer_subscribes_both_execution_tr_ids_on_mock_server() -> None:
 def test_streamer_decrypts_and_parses_fill_notice_per_spec() -> None:
     got = []
     streamer = _streamer_with_callback(got.append)
-    plain = _notice(oder_no="0000123", oder_kind2="0", cntg_qty="1", cntg_unpr="899.45", cntg_yn="2", acpt_yn="2")
+    # 선물 체결단가는 소수점 없이 0.01 단위로 온다(모의투자 실측: 923.85 -> "92385")
+    plain = _notice(oder_no="0000123", oder_kind2="0", cntg_qty="1", cntg_unpr="89945", cntg_yn="2", acpt_yn="2")
     streamer._handle_execution_notice("1", "H0IFCNI0", _encrypt(plain))
 
     assert len(got) == 1
@@ -115,7 +116,7 @@ def test_ack_classification_follows_order_kind_and_correction_flags() -> None:
     registry.register_order_no(order_no="0000123", client_order_id="CID-1")
 
     _feed(connector, _notice(oder_no="0000123", oder_kind2="L", rctf_cls="0", cntg_qty="2", acpt_yn="1"))
-    _feed(connector, _notice(oder_no="0000123", oder_kind2="0", cntg_qty="1", cntg_unpr="899.45"))
+    _feed(connector, _notice(oder_no="0000123", oder_kind2="0", cntg_qty="1", cntg_unpr="89945"))
     _feed(connector, _notice(oder_no="0000124", ooder_no="0000123", oder_kind2="L", rctf_cls="2", cntg_qty="1"))
     _feed(connector, _notice(oder_no="0000125", oder_kind2="L", rfus_yn="1", cntg_qty="1"))
 

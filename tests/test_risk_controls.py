@@ -275,7 +275,7 @@ def test_streamer_retries_flaky_handshake(monkeypatch) -> None:
 
     monkeypatch.setattr(rs.websockets, "connect", _connect)
     streamer = rs.RestStreamer(type("TM", (), {"svr": "vps"})())
-    streamer.RECONNECT_BACKOFF_SEC = (0,)
+    streamer.CONNECT_RETRY_SEC = 0
     monkeypatch.setattr(streamer, "_authenticate", _noop)
     monkeypatch.setattr(streamer, "_message_handler", _noop)
 

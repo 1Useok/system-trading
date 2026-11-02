@@ -19,6 +19,14 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+def _notice_price(raw: str) -> float:
+    """체결통보의 체결단가(CNTG_UNPR). 선물은 소수점 없이 0.01 단위 정수로 온다(실측: 923.85 -> '92385')."""
+    raw = (raw or "").strip()
+    if not raw:
+        return 0.0
+    return float(raw) if "." in raw else int(raw) / 100
+
+
 class RestStreamer:
     """KIS 실시간 데이터(WebSocket) 스트리머"""
 
@@ -27,7 +35,10 @@ class RestStreamer:
     WS_URL_PROD = os.getenv("KIS_WS_URL", "ws://ops.koreainvestment.com:21000")
     WS_URL_VPS = os.getenv("KIS_WS_URL_VPS", "ws://ops.koreainvestment.com:31000")
 
-    CONNECT_ATTEMPTS = 5  # 최초 접속 시도 횟수(백오프 1+2+5+10초). 직전 세션이 정리되기 전 재접속은 몇 초간 거부된다
+    # 최초 접속 재시도. 모의 서버(:31000)는 장중에 핸드셰이크를 무작위로 끊는다(실측: 1분간 12회 중 4회 성공).
+    # 실패가 독립적이라 짧은 간격으로 여러 번 시도하는 편이 길게 기다리는 것보다 낫다.
+    CONNECT_ATTEMPTS = 15
+    CONNECT_RETRY_SEC = 2
     RECONNECT_BACKOFF_SEC = (1, 2, 5, 10, 30)
 
     def __init__(self, token_manager: 'KISTokenManager'):
@@ -54,7 +65,7 @@ class RestStreamer:
         return self._status
 
     async def connect(self, attempts: int = CONNECT_ATTEMPTS) -> bool:
-        """접속합니다. KIS 서버는 핸드셰이크를 간헐적으로 끊으므로(장중 실측) 짧은 백오프로 재시도한다."""
+        """접속합니다. KIS 서버는 핸드셰이크를 간헐적으로 끊으므로(장중 실측) 짧은 간격으로 재시도한다."""
         if self._status == StreamerStatus.CONNECTED:
             return True
         for attempt in range(1, attempts + 1):
@@ -71,7 +82,7 @@ class RestStreamer:
                 if attempt == attempts:
                     logger.error(f"WebSocket connection failed after {attempts} attempts ({self.ws_url}): {e}")
                     return False
-                delay = self.RECONNECT_BACKOFF_SEC[min(attempt - 1, len(self.RECONNECT_BACKOFF_SEC) - 1)]
+                delay = self.CONNECT_RETRY_SEC
                 logger.warning(f"WebSocket connection failed ({attempt}/{attempts}), retry in {delay}s: {e}")
                 await asyncio.sleep(delay)
         return False
@@ -388,7 +399,7 @@ class RestStreamer:
                         "order_kind": fields[6],           # ODER_KIND2: '0'=체결통보, 'L'=접수 통보
                         "symbol": fields[7],               # STCK_SHRN_ISCD
                         "qty": int(fields[8]) if fields[8] else 0,                # CNTG_QTY (통보 종류별 의미 다름)
-                        "price": float(fields[9]) if fields[9] else 0.0,          # CNTG_UNPR
+                        "price": _notice_price(fields[9]),                         # CNTG_UNPR
                         "filled_time": fields[10],         # STCK_CNTG_HOUR
                         "rfus_yn": fields[11],             # 거부여부
                         "cntg_yn": fields[12],             # 체결여부
